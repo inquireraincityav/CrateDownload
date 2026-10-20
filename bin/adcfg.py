@@ -88,6 +88,11 @@ DEFAULTS = {
             "chat_id_file": "",
             "send_audio_helper": "",
             "autosend_captures": False,
+            # Inbound control: when on, the server long-polls getUpdates from
+            # the same bot token and accepts URLs/commands from the locked
+            # chat_id only. Independent of `enabled` so people can keep the
+            # outbound pipe without opening the inbound channel.
+            "control_enabled": False,
         },
         "imessage": {
             "enabled": False,
@@ -216,6 +221,7 @@ class Settings:
         self.tg_chat_file = _expand(tg.get("chat_id_file"))
         self.tg_audio_helper = _expand(tg.get("send_audio_helper"))
         self.tg_autosend = bool(tg.get("autosend_captures"))
+        self.tg_control_enabled = bool(tg.get("control_enabled"))
         im = n.get("imessage") or {}
         self.im_enabled = bool(im.get("enabled"))
         self.im_recipient = im.get("recipient") or ""

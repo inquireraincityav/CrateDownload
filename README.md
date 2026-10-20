@@ -131,6 +131,22 @@ tokens, nothing phones home. A local Notification Centre banner appears when
 a capture finishes. Optional Telegram and iMessage hooks exist in
 `config.json` if you want them; both are blank and off until you fill them in.
 
+### Telegram control from your phone
+
+With `notify.telegram.control_enabled` turned on (same token and `chat_id`
+as the outbound notifier), the server long-polls the Bot API and accepts
+commands from your locked chat only. Any Spotify / YouTube / SoundCloud link
+you message the bot is queued exactly as if you'd pasted it into the web UI.
+Short commands too:
+
+- `status` — current capture + queue
+- `recent` — last 10 finished files
+- `stop` — kill the current capture
+- `resend <name substring>` — re-upload a recent file to Telegram
+- `help`
+
+Messages from any chat other than the configured `chat_id` are ignored.
+
 ---
 
 ## Troubleshooting

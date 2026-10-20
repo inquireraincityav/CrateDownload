@@ -30,7 +30,8 @@
     "telegram": {
       "enabled": false, "token": "", "chat_id": "",
       "token_file": "", "chat_id_file": "",
-      "send_audio_helper": "", "autosend_captures": false
+      "send_audio_helper": "", "autosend_captures": false,
+      "control_enabled": false
     },
     "imessage": {
       "enabled": false, "recipient": "", "attach_helper": "", "send_lock": ""
