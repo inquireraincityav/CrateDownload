@@ -74,6 +74,25 @@ DEFAULTS = {
     # capture queue to everything on the network.
     "server": {"host": "127.0.0.1", "port": 8765},
 
+    # free-text search / version steering. All blank means "yt-dlp ytsearch
+    # only" — the baseline that works with no credentials. Supplying Spotify
+    # Client-Credentials turns on the richer Spotify arm of the resolver.
+    "search": {
+        "spotify": {"client_id": "", "client_secret": ""},
+        # Which source wins when scores are tied. "spotify" (default) favours
+        # the richer metadata; "soundcloud" favours unofficial/VIP edits.
+        "prefer": "spotify",
+    },
+
+    # DJ pools (BPMSupreme / DJcity / Hypeddit). Cookie-authenticated, so
+    # paste exported browser cookies into these files. All off until a path
+    # is set AND enabled.
+    "pools": {
+        "bpmsupreme": {"enabled": False, "cookies_file": ""},
+        "djcity":     {"enabled": False, "cookies_file": ""},
+        "hypeddit":   {"enabled": False, "cookies_file": ""},
+    },
+
     # notifications — all OFF by default. Nothing leaves the machine.
     "notify": {
         "prefix": "",

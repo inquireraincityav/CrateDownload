@@ -35,6 +35,11 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import adcfg  # noqa: E402  (shared config layer — see adcfg.py)
 import tg_control  # noqa: E402  (opt-in inbound Telegram command loop)
+import waveform    # noqa: E402  (waveform PNG path helper — see waveform.py)
+import tracklist   # noqa: E402  (DJ-set tracklist parsing)
+import search      # noqa: E402  (free-text search + version steering)
+import pools       # noqa: E402  (BPMSupreme / DJcity / Hypeddit adapters)
+import naming      # noqa: E402  (post-download title cleanup, pool side)
 
 CFG = adcfg.SETTINGS
 CFG.ensure_dirs()
@@ -226,6 +231,7 @@ def recent_files(n: int = 14):
     out = []
     for mtime, size, p in rows[:n]:
         rel = p.relative_to(STORAGE)
+        wf = waveform.path_for(p)
         out.append({
             "name": pretty_title(p.name),
             "folder": str(rel.parent) if str(rel.parent) != "." else "",
@@ -234,6 +240,7 @@ def recent_files(n: int = 14):
             "age": time.time() - mtime,
             "path": str(p),
             "dir": str(p.parent),
+            "waveform": str(p) if wf.exists() else "",
         })
     _recent_cache.update(t=time.time(), v=out)
     return out
@@ -691,6 +698,9 @@ def classify(url: str):
         host = "open.spotify.com"
     else:
         host = (urlparse(u).hostname or "").lower()
+    pool = pools.classify(u)
+    if pool:
+        return pool, "track"
     if host not in ALLOWED:
         return None, None
     src = "spotify" if "spotify" in host else ("youtube" if "you" in host else "soundcloud")
@@ -705,8 +715,38 @@ def classify(url: str):
     return src, kind
 
 
+def _fire_pool(url: str, entry: dict):
+    """Pool downloads don't share record-audio's pidlock (no audio tap, no
+    Spotify navigation), so they run in-process on the server. The finished
+    file goes through naming cleanup + waveform generation like a yt-dlp rip."""
+    try:
+        saved, note = pools.download(url, CFG, STORAGE, log=applog)
+        if not saved:
+            entry["status"] = "error"
+            entry["result"] = note
+            applog(f"pool fire {url} -> {note}")
+            return
+        clean = naming.rename_and_retag(saved, saved.stem,
+                                        sanitize=lambda s: s, log=applog)
+        try:
+            waveform.generate(clean, CFG.ffmpeg, log=applog)
+        except Exception as e:
+            applog(f"pool waveform error: {e}")
+        entry["status"] = "done"
+        entry["result"] = f"{note} → {clean.name}"
+        applog(f"pool fire {url} -> {clean}")
+    except Exception as e:
+        entry["status"] = "error"
+        entry["result"] = f"{type(e).__name__}: {e}"
+        applog(f"pool fire {url} -> {type(e).__name__}: {e}")
+
+
 def fire(url: str, entry: dict):
-    """Run record-audio for one URL, serialized so two adds can't race the pidlock."""
+    """Run record-audio for one URL, serialized so two adds can't race the pidlock.
+    DJ-pool URLs sidestep record-audio entirely and run through _fire_pool."""
+    if pools.is_pool_url(url):
+        _fire_pool(url, entry)
+        return
     with FIRE_LOCK:
         was_busy = current_pid() is not None
         try:
@@ -733,21 +773,67 @@ def fire(url: str, entry: dict):
                 time.sleep(0.1)
 
 
+def _submit_entry(url: str, src: str, kind: str, note: str = "") -> dict:
+    return {"url": url, "status": "sending", "result": note,
+            "src": src, "kind": kind, "t": time.time()}
+
+
 def submit(text: str):
+    """Accept URLs, 1001tracklists links, or free-text track queries.
+
+    URL → classify + fire (unchanged behaviour).
+    1001tracklists URL → expand to its track list, resolve each via
+        search.resolve(), fire the winning URL for each.
+    Free text with no URL → treat the whole line as a search query
+        (e.g. "Fisher - Losing It VIP Mix"), resolve, fire.
+    """
     found, seen = [], set()
-    for raw in URL_RE.findall(text or ""):
+    raw_text = text or ""
+
+    for raw in URL_RE.findall(raw_text):
         u = raw.rstrip(".,);")
         if u in seen:
             continue
         seen.add(u)
+        if "1001tracklists.com" in u:
+            tracks = tracklist.parse(u)
+            if not tracks:
+                found.append({"url": u, "status": "rejected",
+                              "result": "no tracks parsed from 1001tracklists page",
+                              "src": None, "kind": None, "t": time.time()})
+                continue
+            for t in tracks:
+                hit = search.resolve(t["query"], CFG.ytdlp, settings=CFG, log=applog)
+                if not hit:
+                    found.append({"url": t["query"], "status": "rejected",
+                                  "result": "no match found",
+                                  "src": None, "kind": "search",
+                                  "t": time.time()})
+                    continue
+                found.append(_submit_entry(hit["url"], hit["src"], "track",
+                                           note=f"{t['query']} → {hit['label']}"))
+            continue
+
         src, kind = classify(u)
         if not src:
             found.append({"url": u, "status": "rejected",
                           "result": "not a Spotify / YouTube / SoundCloud link",
                           "src": None, "kind": None, "t": time.time()})
             continue
-        found.append({"url": u, "status": "sending", "result": "",
-                      "src": src, "kind": kind, "t": time.time()})
+        found.append(_submit_entry(u, src, kind))
+
+    # If no URLs at all were found AND the text looks like a track query,
+    # treat the whole thing as a free-text search.
+    if not found and raw_text.strip() and " - " in raw_text:
+        hit = search.resolve(raw_text, CFG.ytdlp, settings=CFG, log=applog)
+        if hit:
+            found.append(_submit_entry(hit["url"], hit["src"], "track",
+                                       note=f"{raw_text.strip()} → {hit['label']}"))
+        else:
+            found.append({"url": raw_text.strip(), "status": "rejected",
+                          "result": "no match found",
+                          "src": None, "kind": "search", "t": time.time()})
+
     with SUBMIT_LOCK:
         for e in found:
             SUBMITS.insert(0, e)
@@ -910,6 +996,9 @@ PAGE = r"""<!doctype html>
   .row:last-child{border-bottom:0}
   .row .n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .row .m{color:var(--dim);font-size:12px;flex:none;font-variant-numeric:tabular-nums}
+  .row.rec{flex-wrap:wrap}
+  .row.rec .wave{flex-basis:100%;width:100%;height:auto;max-height:90px;
+     margin-top:4px;opacity:.9;background:transparent;image-rendering:-webkit-optimize-contrast}
   .pill{font-size:10.5px;letter-spacing:.4px;text-transform:uppercase;padding:3px 7px;
      border-radius:999px;background:#242933;color:var(--dim);flex:none;font-weight:600}
   .pill.ok{background:rgba(30,215,96,.14);color:var(--accent)}
@@ -1352,10 +1441,15 @@ function recentCard(s){
   const rows = s.recent.map(f => {
     const fresh = f.age < 900 ? `<span class="pill ok">new</span>` : "";
     const fold = f.folder ? `<div class="folder">${esc(f.folder)}/</div>` : "";
-    return `<div class="row"><div class="n">${esc(f.name)}${fold}</div>
+    const wave = f.waveform
+      ? `<img class="wave" alt="" loading="lazy"
+             src="/api/waveform?path=${encodeURIComponent(f.waveform)}">`
+      : "";
+    return `<div class="row rec"><div class="n">${esc(f.name)}${fold}</div>
       ${fresh}<span class="m">${f.mb} MB · ${esc(f.when)}</span>
       <button class="mini" data-file data-reveal="${esc(f.path)}"
-        title="Reveal in Finder">&#128269;</button></div>`;
+        title="Reveal in Finder">&#128269;</button>
+      ${wave}</div>`;
   });
   return `<div class="card">${rows.join("")}</div>`;
 }
@@ -1417,7 +1511,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(perms_payload()))
         if path == "/health":
             return self._send(200, "ok", "text/plain")
+        if path == "/api/waveform":
+            return self._serve_waveform(parse_qs(urlparse(self.path).query))
         self._send(404, json.dumps({"error": "not found"}))
+
+    def _serve_waveform(self, qs):
+        """Serve the PNG waveform for an audio file inside STORAGE. Jailed
+        to the configured storage dir — a reachable port can't be used to
+        probe arbitrary paths. 404 on anything outside, missing, or empty."""
+        raw = (qs.get("path") or [""])[0]
+        if not raw:
+            return self._send(404, "")
+        try:
+            audio = Path(raw).resolve()
+            root = STORAGE.resolve()
+            audio.relative_to(root)
+        except (OSError, ValueError):
+            return self._send(404, "")
+        png = waveform.path_for(audio)
+        if not png.is_file() or png.stat().st_size == 0:
+            return self._send(404, "")
+        try:
+            data = png.read_bytes()
+        except OSError:
+            return self._send(404, "")
+        self._send(200, data, "image/png")
 
     def do_POST(self):
         path = urlparse(self.path).path

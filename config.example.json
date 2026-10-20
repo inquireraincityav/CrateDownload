@@ -24,6 +24,15 @@
     "ensure_rate": ""
   },
   "server": { "host": "127.0.0.1", "port": 8765 },
+  "search": {
+    "spotify": { "client_id": "", "client_secret": "" },
+    "prefer": "spotify"
+  },
+  "pools": {
+    "bpmsupreme": { "enabled": false, "cookies_file": "" },
+    "djcity":     { "enabled": false, "cookies_file": "" },
+    "hypeddit":   { "enabled": false, "cookies_file": "" }
+  },
   "notify": {
     "prefix": "",
     "desktop": { "enabled": true },

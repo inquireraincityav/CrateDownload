@@ -37,6 +37,8 @@ from pathlib import Path as pathlib_Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import adcfg  # noqa: E402  (shared config layer — see adcfg.py)
+import waveform  # noqa: E402  (per-track waveform PNG — see waveform.py)
+import naming    # noqa: E402  (yt-dlp title cleanup + ID3 fixup — see naming.py)
 
 CFG = adcfg.SETTINGS
 
@@ -1764,6 +1766,7 @@ def capture_spotify_track(meta, dest_dir, idx=None):
     check_tail_bleed(final)
     log(f"spotify capture done: {final}")
     mirror_to_icloud(final, MIRROR_CAPTURES)
+    waveform.generate(final, FFMPEG, log=log)
     return final, ended_via_wrap
 
 
@@ -1906,9 +1909,16 @@ def capture_ytdlp(url):
         log(f"yt-dlp rc={r.returncode}: {r.stderr}")
         return []
     paths = [Path(p) for p in r.stdout.strip().splitlines() if p.strip() and Path(p).exists()]
+    cleaned = []
     for p in paths:
-        mirror_to_icloud(p, MIRROR_DOWNLOADS)
-    return paths
+        # yt-dlp's filename stem is the uploader's raw title. Clean it,
+        # rewrite ID3, rename the file. Mirror + waveform work on the
+        # NEW path so mirrored copies carry the clean name too.
+        final = naming.rename_and_retag(p, p.stem, sanitize=sanitize, log=log)
+        mirror_to_icloud(final, MIRROR_DOWNLOADS)
+        waveform.generate(final, FFMPEG, log=log)
+        cleaned.append(final)
+    return cleaned
 
 
 def parse_duration(s):

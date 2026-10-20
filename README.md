@@ -54,9 +54,22 @@ Open **Audio Downloader** from Launchpad. Paste one or more links, hit Capture.
 
 - **Spotify** track / album / playlist — recorded from the Spotify app
 - **YouTube / SoundCloud** — downloaded directly, no recording needed
+- **1001tracklists** set URL — parses the tracklist and searches each entry
+- **Free text** like "Fisher - Losing It VIP Mix" — resolved via the
+  search layer; a version marker steers the pick (SoundCloud wins for VIPs
+  that Spotify doesn't carry)
+- **BPMSupreme / DJcity / Hypeddit** URL — if that pool is enabled in config
+  with a cookies file, the download uses your logged-in session
 
 Finished files show at the bottom of the window with a 🔍 button that jumps
-straight to them in Finder.
+straight to them in Finder, and a waveform preview under the row.
+
+### yt-dlp names, cleaned up
+
+Downloads inherit the uploader's title — "ARTIST - TRACK (Official Audio)
+[FREE DL] [320kbps]" and friends. The engine strips the boilerplate on
+save, splits into Artist / Title / Version, rewrites ID3, and renames the
+file to `Artist - Title (Version).mp3`.
 
 ### Settings
 
