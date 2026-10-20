@@ -1,0 +1,1543 @@
+#!/usr/bin/env python3
+"""audio-downloader — local capture app (Sidify-style) for Spotify / YouTube / SoundCloud.
+
+Serves a single-page web app on localhost. Paste or drop a track / album /
+playlist link and it fires `record-audio <url>` — the same capture engine
+every other entry point uses. No LLM, no network calls to anything but the
+Mac itself, and nothing listens beyond this machine.
+
+Everything machine-specific comes from adcfg (see adcfg.py). State it reads,
+all written by record-audio and never by this app:
+  <state_dir>/record-audio.pid   — capture in flight
+  <state_dir>/rec-queue.json     — pending URLs
+  <log_file>                     — per-track progress lines
+
+Env: AUDIO_DOWNLOADER_CONFIG, AUDIO_DOWNLOADER_PORT, AUDIO_DOWNLOADER_HOST,
+     AUDIO_DOWNLOADER_LABEL (the launchd job to kickstart on a settings save)
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import socket
+import ctypes
+import ctypes.util
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import adcfg  # noqa: E402  (shared config layer — see adcfg.py)
+
+CFG = adcfg.SETTINGS
+CFG.ensure_dirs()
+
+HOME = Path.home()
+RECORD_AUDIO = Path(__file__).resolve().parent / "record-audio"
+# Always spawn the engine as [interpreter, script] rather than relying on its
+# shebang. The default install path contains a space ("Application Support"),
+# which a shebang cannot express — the kernel splits on the first whitespace,
+# and the failure then reads as ENOENT on the script itself, which is
+# thoroughly misleading. Naming the interpreter sidesteps the whole problem.
+RECORD_AUDIO_CMD = [sys.executable, str(RECORD_AUDIO)]
+STORAGE = CFG.storage
+STATE_DIR = CFG.state_dir
+PIDFILE = STATE_DIR / "record-audio.pid"
+QUEUEFILE = STATE_DIR / "rec-queue.json"
+LOGFILE = CFG.log_file
+APPLOG = STATE_DIR / "audio-downloader.log"
+
+PORT = CFG.port
+HOST = CFG.host
+
+# Audio extensions the "Finished" list surfaces. mp3 is what record-audio
+# produces today; the rest are here so a reconfigured engine still shows up.
+AUDIO_EXTS = (".mp3", ".m4a", ".wav", ".aiff", ".flac", ".opus")
+
+URL_RE = re.compile(r"(https?://[^\s<>\"']+|spotify:[a-z]+:[A-Za-z0-9]+)")
+ALLOWED = (
+    "open.spotify.com", "spotify.link",
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
+    "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com",
+)
+SPOTIFY_KIND_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z]{2}/)?(track|album|playlist)/|spotify:(track|album|playlist):"
+)
+LOGLINE_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[record-audio\] (.*)$")
+START_RE = re.compile(r"^spotify capture starting: (.+?) id=(\S*) dur=(\d+)ms$")
+DONE_RE = re.compile(r"^spotify capture done: (.+)$")
+SKIP_RE = re.compile(r"^spotify capture skip \(already exists, duration-verified\): (.+)$")
+FOLDER_RE = re.compile(r"^spotify (track|album|playlist) folder: (.+)$")
+NN_RE = re.compile(r"^\d{2} - ")
+
+
+def applog(msg: str) -> None:
+    try:
+        with open(APPLOG, "a") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- engine state
+
+def pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def current_pid():
+    try:
+        pid = int(PIDFILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid_running(pid) else None
+
+
+def queue_load():
+    try:
+        return json.loads(QUEUEFILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def session_start() -> float:
+    try:
+        return PIDFILE.stat().st_mtime - 3.0
+    except OSError:
+        return time.time()
+
+
+def read_log_lines(limit_bytes: int = 262144):
+    """Return [(epoch, msg)] for record-audio lines in the log tail."""
+    try:
+        size = LOGFILE.stat().st_size
+        with open(LOGFILE, "rb") as f:
+            if size > limit_bytes:
+                f.seek(size - limit_bytes)
+                f.readline()
+            raw = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    out = []
+    for line in raw.splitlines():
+        m = LOGLINE_RE.match(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            continue
+        out.append((ts, m.group(2)))
+    return out
+
+
+def pretty_title(path_str: str) -> str:
+    stem = Path(path_str).stem
+    return NN_RE.sub("", stem)
+
+
+def capture_progress():
+    """Derive what's happening right now from record-audio's own log lines."""
+    pid = current_pid()
+    if not pid:
+        return None
+    t0 = session_start()
+    lines = [(ts, m) for ts, m in read_log_lines() if ts >= t0]
+    info = {
+        "pid": pid,
+        "container": None,
+        "kind": None,
+        "track": None,
+        "elapsed": None,
+        "duration": None,
+        "percent": None,
+        "done_count": 0,
+        "stage": "starting",
+    }
+    started = None
+    done_paths, skip_paths = set(), set()
+    for ts, msg in lines:
+        m = FOLDER_RE.match(msg)
+        if m:
+            info["kind"] = m.group(1)
+            info["container"] = Path(m.group(2)).name
+            continue
+        m = START_RE.match(msg)
+        if m:
+            started = (ts, m.group(1), int(m.group(3)) / 1000.0)
+            continue
+        m = DONE_RE.match(msg)
+        if m:
+            done_paths.add(m.group(1))
+            continue
+        m = SKIP_RE.match(msg)
+        if m:
+            skip_paths.add(m.group(1))
+            continue
+        if msg.startswith("yt-dlp"):
+            info["stage"] = "downloading"
+    info["done_count"] = len(done_paths | skip_paths)
+    if started:
+        ts, path, dur = started
+        if path in done_paths:
+            info["stage"] = "next track…"
+            info["track"] = None
+        else:
+            elapsed = max(0.0, time.time() - ts)
+            info["stage"] = "capturing"
+            info["track"] = pretty_title(path)
+            info["path"] = path
+            info["elapsed"] = round(elapsed, 1)
+            info["duration"] = round(dur, 1)
+            info["percent"] = round(min(100.0, elapsed / dur * 100.0), 1) if dur > 0 else None
+    return info
+
+
+_recent_cache = {"t": 0.0, "v": []}
+
+
+def recent_files(n: int = 14):
+    if time.time() - _recent_cache["t"] < 3.0:
+        return _recent_cache["v"]
+    rows = []
+    try:
+        for p in STORAGE.rglob("*"):
+            if p.suffix.lower() not in AUDIO_EXTS or not p.is_file():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            rows.append((st.st_mtime, st.st_size, p))
+    except OSError:
+        rows = []
+    rows.sort(reverse=True, key=lambda r: r[0])
+    out = []
+    for mtime, size, p in rows[:n]:
+        rel = p.relative_to(STORAGE)
+        out.append({
+            "name": pretty_title(p.name),
+            "folder": str(rel.parent) if str(rel.parent) != "." else "",
+            "mb": round(size / 1_000_000, 1),
+            "when": datetime.fromtimestamp(mtime).strftime("%b %-d, %-I:%M %p"),
+            "age": time.time() - mtime,
+            "path": str(p),
+            "dir": str(p.parent),
+        })
+    _recent_cache.update(t=time.time(), v=out)
+    return out
+
+
+def reveal(target: str, select: bool = True):
+    """Open Finder at `target`. Jailed to the configured storage dir so an
+    open port on the LAN/tailnet can't be used to poke around the filesystem.
+    Returns (ok, message)."""
+    try:
+        p = Path(target).expanduser().resolve()
+    except (OSError, RuntimeError) as e:
+        return False, f"bad path: {e}"
+    try:
+        root = STORAGE.resolve()
+    except OSError:
+        root = STORAGE
+    allowed = p == root or root in p.parents
+    if not allowed:
+        # the config file (and the folder holding it) is the one thing outside
+        # the capture dir the UI may point Finder at -- the Settings panel
+        # needs an "open my config" affordance.
+        try:
+            cfg = CFG.path.resolve()
+            allowed = p in (cfg, cfg.parent)
+        except OSError:
+            allowed = False
+    if not allowed:
+        applog(f"reveal REFUSED (outside storage): {p}")
+        return False, "path is outside the capture folder"
+    if not p.exists():
+        return False, "file is no longer there"
+    cmd = ["/usr/bin/open", "-R", str(p)] if (select and p.is_file()) else ["/usr/bin/open", str(p)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False, (r.stderr or "").strip()[:200] or f"rc={r.returncode}"
+        applog(f"reveal {p}")
+        return True, "opened in Finder"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def pick_path(mode, start):
+    """Native Finder chooser. Returns (ok, posix path) or (False, message).
+
+    `choose folder`/`choose file` need a real GUI session, so this runs via
+    osascript against System Events and comes back as a POSIX path, not an
+    HFS alias string. Cancel is rc=1 with "User canceled" -- not an error
+    worth shouting about, so it returns quietly.
+    """
+    d = ""
+    try:
+        p = Path(os.path.expanduser(start or "")).expanduser()
+        if mode == "file":
+            p = p.parent
+        while p != p.parent and not p.is_dir():
+            p = p.parent
+        if p.is_dir():
+            d = f'default location POSIX file "{str(p)}" '
+    except Exception:
+        d = ""
+    verb = "choose file" if mode == "file" else "choose folder"
+    scpt = (f'tell application "System Events" to activate\n'
+            f'set f to {verb} with prompt "Choose a '
+            f'{"file" if mode == "file" else "folder"}" {d}\n'
+            f'return POSIX path of f')
+    try:
+        r = subprocess.run(["osascript", "-e", scpt],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    if r.returncode != 0:
+        err = (r.stderr or "").strip()
+        if "-128" in err or "cancel" in err.lower():
+            return False, ""
+        return False, err[:160] or f"rc={r.returncode}"
+    out = (r.stdout or "").strip().rstrip("/")
+    if not out:
+        return False, ""
+    applog(f"pick {mode} -> {out}")
+    return True, out
+
+
+
+# ------------------------------------------------------------- permissions
+# First-run setup. macOS privacy permissions (TCC) cannot be granted
+# programmatically -- not even as root, SIP owns that database. What we CAN
+# do is tell the user exactly which three switches matter, check each one
+# honestly, and deep-link straight to the pane instead of making them hunt.
+
+SETUP_STATE = CFG.path.parent / "setup_state.json"
+
+PERMS = [
+    ("screen", "Screen Recording",
+     "Spotify captures are recorded off the app's own audio stream. macOS files "
+     "that under Screen Recording even though no video is touched.",
+     "Privacy_ScreenCapture"),
+    ("mic", "Microphone",
+     "The raw-capture path taps the BlackHole input device. macOS treats every "
+     "audio input as a microphone.",
+     "Privacy_Microphone"),
+    ("spotify", "Automation ▸ Spotify",
+     "Lets the app start, stop and read the current track in Spotify so captures "
+     "line up with track boundaries.",
+     "Privacy_Automation"),
+]
+
+_PERM_PANE = {k: pane for k, _l, _h, pane in PERMS}
+
+
+def _tcc_screen():
+    try:
+        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        return "ok" if cg.CGPreflightScreenCaptureAccess() else "denied"
+    except Exception as e:
+        applog(f"perm screen check failed: {type(e).__name__}: {e}")
+        return "unknown"
+
+
+def _tcc_mic():
+    # AVCaptureDevice.authorizationStatusForMediaType(.audio) via the objc
+    # runtime -- system python has no pyobjc, and this never prompts.
+    try:
+        objc = ctypes.CDLL(ctypes.util.find_library("objc"))
+        ctypes.CDLL(ctypes.util.find_library("AVFoundation"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        send = objc.objc_msgSend
+        send.restype = ctypes.c_void_p
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+        media = send(objc.objc_getClass(b"NSString"),
+                     objc.sel_registerName(b"stringWithUTF8String:"), b"soun")
+        send.restype = ctypes.c_long
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        v = send(objc.objc_getClass(b"AVCaptureDevice"),
+                 objc.sel_registerName(b"authorizationStatusForMediaType:"), media)
+        return {0: "unknown", 1: "denied", 2: "denied", 3: "ok"}.get(int(v), "unknown")
+    except Exception as e:
+        applog(f"perm mic check failed: {type(e).__name__}: {e}")
+        return "unknown"
+
+
+def _tcc_spotify(active=False):
+    """Automation-for-Spotify. Passive checks are cached, because the only
+    honest probe is an actual Apple Event -- and that launches Spotify if it
+    isn't running. So the passive path reports the last known answer and the
+    Check button does the real thing."""
+    if not active:
+        try:
+            return json.loads(SETUP_STATE.read_text()).get("spotify", "unknown")
+        except Exception:
+            return "unknown"
+    scpt = 'tell application id "com.spotify.client" to return player state as text'
+    try:
+        r = subprocess.run(["osascript", "-e", scpt],
+                           capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        applog(f"perm spotify probe failed: {type(e).__name__}: {e}")
+        return "unknown"
+    err = (r.stderr or "")
+    if r.returncode == 0:
+        res = "ok"
+    elif "-1743" in err or "Not authorized" in err or "not allowed" in err:
+        res = "denied"
+    elif "-1728" in err or "-600" in err:
+        # reachable but odd reply -- the Apple Event itself got through,
+        # which is the thing being tested.
+        res = "ok"
+    else:
+        applog(f"perm spotify probe rc={r.returncode} {err.strip()[:160]!r}")
+        res = "unknown"
+    _setup_write({"spotify": res})
+    return res
+
+
+def _setup_read():
+    try:
+        return json.loads(SETUP_STATE.read_text())
+    except Exception:
+        return {}
+
+
+def _setup_write(patch):
+    d = _setup_read()
+    d.update(patch)
+    try:
+        SETUP_STATE.parent.mkdir(parents=True, exist_ok=True)
+        SETUP_STATE.write_text(json.dumps(d, indent=2))
+    except Exception as e:
+        applog(f"setup_state write failed: {type(e).__name__}: {e}")
+    return d
+
+
+def perms_payload(active=None):
+    st = _setup_read()
+    checks = {"screen": _tcc_screen, "mic": _tcc_mic,
+              "spotify": lambda: _tcc_spotify(active == "spotify")}
+    items = []
+    for key, label, help_, _pane in PERMS:
+        items.append({"key": key, "label": label, "help": help_,
+                      "status": checks[key]()})
+    allok = all(i["status"] == "ok" for i in items)
+    return {"items": items, "all_ok": allok,
+            "dismissed": bool(st.get("dismissed")),
+            "show": not (allok or st.get("dismissed"))}
+
+
+def perms_open(key):
+    pane = _PERM_PANE.get(key)
+    if not pane:
+        return False, "unknown pane"
+    url = f"x-apple.systempreferences:com.apple.preference.security?{pane}"
+    try:
+        subprocess.run(["/usr/bin/open", url], capture_output=True,
+                       text=True, timeout=15)
+        applog(f"opened settings pane {pane}")
+        return True, "System Settings opened"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+# ------------------------------------------------------------------ settings
+
+# Every key the UI is allowed to touch. (json path, kind, label, help)
+EDITABLE = [
+    ("storage_dir",          "path",   "Capture folder",
+     "Where finished tracks land."),
+    ("mirrors.captures",     "path?",  "Mirror — captures",
+     "Optional second copy of Spotify captures. Blank = off."),
+    ("mirrors.downloads",    "path?",  "Mirror — downloads",
+     "Optional second copy of YouTube/SoundCloud rips. Blank = off."),
+    ("state_dir",            "path",   "Working folder",
+     "Queue, pid file and temp segments."),
+    ("log_file",             "path",   "Log file",
+     "Engine log. The progress bar is parsed out of this."),
+    ("silent_output_device", "device", "Silent device",
+     "Output the Mac is parked on while capturing, so nothing hits the speakers."),
+    ("multi_output_name",    "text",   "Multi-output name",
+     "Aggregate device built for raw (non-Spotify) captures."),
+    ("server.port",          "int",    "Port",
+     "Web UI port. Changing it restarts the app."),
+]
+
+_NEEDS_RESTART = {"state_dir", "log_file", "server.port"}
+
+
+def _dig(d, dotted, default=None):
+    cur = d
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
+
+
+def _plant(d, dotted, value):
+    parts = dotted.split(".")
+    cur = d
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def output_devices():
+    """Names of every output device SwitchAudioSource can see."""
+    try:
+        r = subprocess.run([CFG.switch, "-a", "-t", "output"],
+                           capture_output=True, text=True, timeout=8)
+        return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+def config_raw() -> dict:
+    """The on-disk JSON exactly as written (not merged with defaults), so a
+    save never silently bakes every default into the user's file."""
+    try:
+        return json.loads(CFG.path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def config_payload():
+    raw = config_raw()
+    merged = adcfg.load(write_if_missing=False)
+    fields = []
+    for key, kind, label, help_ in EDITABLE:
+        val = _dig(raw, key, None)
+        if val is None:
+            val = _dig(merged, key, "")
+        fields.append({
+            "key": key, "kind": kind, "label": label, "help": help_,
+            "value": "" if val is None else str(val),
+            "resolved": pretty_path(_dig(merged, key, "") or ""),
+        })
+    return {
+        "path": str(CFG.path),
+        "fields": fields,
+        "devices": output_devices(),
+        "notice": "Paths accept ~ and $VARS. Saving rewrites only the keys you changed.",
+    }
+
+
+def config_save(values: dict):
+    """Validate + merge into the config file. Returns (ok, msg, restart)."""
+    raw = config_raw()
+    spec = {k: (kind, label) for k, kind, label, _ in EDITABLE}
+    changed, restart = [], False
+    for key, newval in (values or {}).items():
+        if key not in spec:
+            continue
+        kind, label = spec[key]
+        v = (newval or "").strip() if isinstance(newval, str) else newval
+
+        if kind == "int":
+            try:
+                v = int(str(v))
+            except ValueError:
+                return False, f"{label}: not a number", False
+            if not (1024 <= v <= 65535):
+                return False, f"{label}: must be 1024-65535", False
+        elif kind in ("path", "path?"):
+            if not v:
+                if kind == "path":
+                    return False, f"{label}: cannot be blank", False
+                v = None
+            else:
+                probe = Path(os.path.expandvars(os.path.expanduser(str(v))))
+                # log_file names a file; every other path key names a folder
+                mk = probe.parent if key == "log_file" else probe
+                try:
+                    mk.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    return False, f"{label}: cannot create ({e.strerror})", False
+                if not os.access(mk, os.W_OK):
+                    return False, f"{label}: not writable", False
+        elif kind == "device":
+            devs = output_devices()
+            if devs and v not in devs:
+                return False, f"{label}: no output device called {v!r}", False
+        elif kind == "text":
+            if not v:
+                return False, f"{label}: cannot be blank", False
+
+        if _dig(raw, key, None) != v:
+            _plant(raw, key, v)
+            changed.append(key)
+            if key in _NEEDS_RESTART:
+                restart = True
+
+    if not changed:
+        return True, "nothing changed", False
+    try:
+        CFG.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CFG.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(raw, indent=2) + "\n")
+        tmp.replace(CFG.path)
+    except OSError as e:
+        return False, f"could not write config: {e}", False
+    applog(f"config saved: {', '.join(changed)}")
+    # The engine re-reads the file on every invocation, so record-audio picks
+    # changes up immediately. This process cached its own copy at import.
+    return True, f"saved {len(changed)} setting{'s' if len(changed) != 1 else ''}", True
+
+
+def uninstall_spawn(purge_music=False, remove_deps=False):
+    """Hand the uninstall off to a detached copy of the installer script.
+
+    Two reasons it cannot run in place. The script removes the directory it
+    lives in, and bash reads a script incrementally — deleting it mid-run
+    truncates execution at an arbitrary line. And the very first thing it does
+    is stop this launchd job, which kills whatever it was started from, so it
+    has to be in its own session with no parent left to take it down.
+    """
+    import shutil
+    import tempfile
+
+    src = CFG.path.parent / "install.sh"
+    if not src.exists():
+        return False, (f"no uninstaller found at {src} — run install.sh "
+                       "--uninstall from the kit folder instead")
+
+    tmpdir = tempfile.mkdtemp(prefix="ad-uninstall-")
+    script = Path(tmpdir) / "uninstall.sh"
+    shutil.copy2(src, script)
+    script.chmod(0o755)
+
+    argv = ["/bin/bash", str(script), "--uninstall",
+            "--prefix", str(CFG.path.parent)]
+    label = os.environ.get("AUDIO_DOWNLOADER_LABEL", "")
+    if label:
+        argv += ["--label", label]
+    if purge_music:
+        argv.append("--purge-music")
+    if remove_deps:
+        argv.append("--remove-deps")
+
+    # A hand-rolled install can keep the engine outside the support folder, so
+    # tell the script where the pieces actually are rather than let it guess.
+    env = dict(os.environ)
+    env["AD_UNINSTALL_RECORD_AUDIO"] = str(RECORD_AUDIO)
+    env["AD_UNINSTALL_PYTHON"] = sys.executable
+    if getattr(CFG, "multiout", ""):
+        env["AD_UNINSTALL_MULTIOUT"] = str(CFG.multiout)
+
+    logpath = Path(tmpdir) / "uninstall.log"
+    applog(f"uninstall requested (purge_music={purge_music}, "
+           f"remove_deps={remove_deps}) -> {logpath}")
+    try:
+        fh = open(logpath, "wb")
+        subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, cwd="/", env=env,
+                         start_new_session=True)
+    except Exception as e:
+        return False, f"could not start the uninstaller: {type(e).__name__}: {e}"
+    return True, str(logpath)
+
+
+def self_restart():
+    """Bounce our own launchd job so the new config is live. If we are not
+    running under launchd, just exit -- whatever supervises us restarts us."""
+    # The launchd job sets AUDIO_DOWNLOADER_LABEL in its plist. Without it we
+    # cannot know which job owns us, so we just exit and let the supervisor
+    # (launchd KeepAlive, or a shell) bring us back.
+    label = os.environ.get("AUDIO_DOWNLOADER_LABEL", "")
+    def go():
+        time.sleep(0.6)
+        if label:
+            r = subprocess.run(["launchctl", "kickstart", "-k",
+                                f"gui/{os.getuid()}/{label}"], capture_output=True)
+            if r.returncode == 0:
+                return
+        os._exit(0)
+    threading.Thread(target=go, daemon=True).start()
+
+
+# ------------------------------------------------------------ submit pipeline
+
+SUBMITS = []            # newest-first log of what this app has fired
+SUBMIT_LOCK = threading.Lock()
+FIRE_LOCK = threading.Lock()
+
+
+def classify(url: str):
+    u = url.strip()
+    if u.startswith("spotify:"):
+        host = "open.spotify.com"
+    else:
+        host = (urlparse(u).hostname or "").lower()
+    if host not in ALLOWED:
+        return None, None
+    src = "spotify" if "spotify" in host else ("youtube" if "you" in host else "soundcloud")
+    kind = "track"
+    m = SPOTIFY_KIND_RE.search(u)
+    if m:
+        kind = m.group(1) or m.group(2)
+    elif src == "spotify":
+        kind = "link"     # short spotify.link — record-audio resolves it
+    elif "list=" in u or "/sets/" in u:
+        kind = "playlist"
+    return src, kind
+
+
+def fire(url: str, entry: dict):
+    """Run record-audio for one URL, serialized so two adds can't race the pidlock."""
+    with FIRE_LOCK:
+        was_busy = current_pid() is not None
+        try:
+            r = subprocess.run(
+                RECORD_AUDIO_CMD + [url],
+                capture_output=True, text=True, timeout=60,
+            )
+            out = (r.stdout or "").strip() or (r.stderr or "").strip()
+            entry["result"] = out[:200] or f"rc={r.returncode}"
+            entry["status"] = "queued" if was_busy else "capturing"
+            applog(f"fired {url} -> rc={r.returncode} {out!r}")
+        except subprocess.TimeoutExpired:
+            entry["status"] = "error"
+            entry["result"] = "record-audio did not return within 60s"
+            applog(f"fired {url} -> TIMEOUT")
+        except Exception as e:
+            entry["status"] = "error"
+            entry["result"] = f"{type(e).__name__}: {e}"
+            applog(f"fired {url} -> {type(e).__name__}: {e}")
+        if not was_busy:
+            for _ in range(60):          # let the worker take the pidlock
+                if current_pid():
+                    break
+                time.sleep(0.1)
+
+
+def submit(text: str):
+    found, seen = [], set()
+    for raw in URL_RE.findall(text or ""):
+        u = raw.rstrip(".,);")
+        if u in seen:
+            continue
+        seen.add(u)
+        src, kind = classify(u)
+        if not src:
+            found.append({"url": u, "status": "rejected",
+                          "result": "not a Spotify / YouTube / SoundCloud link",
+                          "src": None, "kind": None, "t": time.time()})
+            continue
+        found.append({"url": u, "status": "sending", "result": "",
+                      "src": src, "kind": kind, "t": time.time()})
+    with SUBMIT_LOCK:
+        for e in found:
+            SUBMITS.insert(0, e)
+        del SUBMITS[60:]
+    for e in found:
+        if e["status"] == "sending":
+            threading.Thread(target=fire, args=(e["url"], e), daemon=True).start()
+    return found
+
+
+def watch_submits():
+    """Resolve in-flight submits once the engine goes idle.
+
+    record-audio drains its own queue serially, so when the pidlock clears AND
+    the queue file is empty, everything this app fired has finished. Per-URL
+    attribution is only exact when a single submit was in flight; with several
+    we mark them finished without inventing per-item counts."""
+    while True:
+        time.sleep(1.5)
+        try:
+            with SUBMIT_LOCK:
+                actives = [e for e in SUBMITS if e.get("status") in ("capturing", "queued")]
+            if not actives:
+                continue
+            if current_pid() or queue_load():
+                continue
+            lines = read_log_lines()
+            t0 = min(e["t"] for e in actives) - 3
+            rel = [m for ts, m in lines if ts >= t0]
+            # Keep the paths, not just the counts. A skip used to report only
+            # "already on disk — skipped" against the raw URL, which is
+            # indistinguishable from a failure: you cannot tell what it
+            # matched, and because a skip does not touch the file's mtime the
+            # track may be far too old to appear in the Finished list.
+            done_paths = [m.group(1) for m in (DONE_RE.match(x) for x in rel) if m]
+            skip_paths = [m.group(1) for m in (SKIP_RE.match(x) for x in rel) if m]
+            done, skip = len(done_paths), len(skip_paths)
+            summary, one_path = "", None
+            if len(actives) == 1:
+                if done and skip:
+                    summary = f"{done} captured, {skip} already on disk"
+                elif done == 1:
+                    summary = f"captured {pretty_title(done_paths[0])}"
+                    one_path = done_paths[0]
+                elif done:
+                    summary = f"{done} captured"
+                elif skip == 1:
+                    summary = f"{pretty_title(skip_paths[0])} — already on disk, kept"
+                    one_path = skip_paths[0]
+                elif skip:
+                    summary = f"{skip} already on disk — skipped"
+            with SUBMIT_LOCK:
+                for e in actives:
+                    e["status"] = "skipped" if (len(actives) == 1 and skip and not done) else "done"
+                    e["result"] = summary
+                    if one_path:
+                        e["path"] = one_path
+                    e["finished"] = time.time()
+            applog(f"resolved {len(actives)} submit(s): done={done} skip={skip}")
+        except Exception as exc:
+            applog(f"watch_submits error: {type(exc).__name__}: {exc}")
+
+
+def pretty_path(p) -> str:
+    s = str(p)
+    h = str(Path.home())
+    return "~" + s[len(h):] if s.startswith(h) else s
+
+
+def status_payload():
+    cap = capture_progress()
+    q = queue_load()
+    with SUBMIT_LOCK:
+        subs = [dict(e) for e in SUBMITS[:12]]
+    return {
+        "capturing": cap is not None,
+        "now": cap,
+        "queue": [{"url": it.get("url", ""), "label": it.get("label", "")} for it in q],
+        "submits": subs,
+        "recent": recent_files(),
+        "storage": str(STORAGE),
+        "storage_pretty": pretty_path(STORAGE),
+        "mirrors": [pretty_path(m) for m in (CFG.mirror_captures, CFG.mirror_downloads) if m],
+        "config_path": str(CFG.path),
+        "time": datetime.now().strftime("%-I:%M:%S %p"),
+    }
+
+
+# ------------------------------------------------------------------- the page
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Audio Downloader</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127908;</text></svg>">
+<style>
+  :root{ --bg:#0d0f12; --card:#16191f; --card2:#1c2027; --line:#262b34;
+         --fg:#e8eaed; --dim:#8a919c; --accent:#1ed760; --warn:#f5a524; --bad:#f45b5b; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text",Helvetica,sans-serif;
+       -webkit-font-smoothing:antialiased;padding:0 0 60px}
+  header{position:sticky;top:0;z-index:5;background:rgba(13,15,18,.86);
+         backdrop-filter:blur(14px);border-bottom:1px solid var(--line);
+         padding:14px 18px calc(14px + env(safe-area-inset-top)) 18px}
+  .wrap{max-width:760px;margin:0 auto}
+  h1{font-size:17px;margin:0;font-weight:600;letter-spacing:.2px;display:flex;
+     align-items:center;gap:8px}
+  h1 .dot{width:8px;height:8px;border-radius:50%;background:#3a4150;flex:none}
+  h1 .dot.live{background:var(--accent);box-shadow:0 0 0 0 rgba(30,215,96,.6);
+       animation:pulse 1.8s infinite}
+  @keyframes pulse{70%{box-shadow:0 0 0 9px rgba(30,215,96,0)}
+                   100%{box-shadow:0 0 0 0 rgba(30,215,96,0)}}
+  h1 small{color:var(--dim);font-weight:400;font-size:12px;margin-left:auto}
+  form{display:flex;gap:8px;margin-top:12px}
+  textarea{flex:1;background:var(--card);border:1px solid var(--line);color:var(--fg);
+     border-radius:11px;padding:11px 13px;font:15px/1.4 inherit;resize:none;height:44px;
+     outline:none;transition:border-color .15s,height .15s}
+  textarea:focus{border-color:var(--accent);height:88px}
+  textarea.drag{border-color:var(--accent);background:#132018}
+  button{background:var(--accent);color:#06240f;border:0;border-radius:11px;
+     padding:0 20px;font:600 15px/1 inherit;cursor:pointer;min-height:44px;flex:none}
+  button:active{transform:scale(.97)}
+  button.ghost{background:transparent;color:var(--dim);border:1px solid var(--line)}
+  button.stop{background:var(--bad);color:#2a0606}
+  .card.danger{border-color:#4a2426;background:#191113}
+  .dz-copy{font-size:12.5px;color:var(--dim);line-height:1.5}
+  .dz-copy b{color:var(--fg);font-weight:600}
+  .dz-check{display:flex;align-items:flex-start;gap:8px;margin-top:10px;
+            font-size:12.5px;color:var(--fg);cursor:pointer}
+  .dz-check input{margin:2px 0 0;accent-color:var(--bad);min-height:0;width:auto}
+  .dz-path{color:var(--dim);word-break:break-all}
+  .dz-confirm{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+  .dz-confirm input{flex:1;min-width:140px;background:var(--bg);
+    border:1px solid var(--line);color:var(--fg);border-radius:11px;
+    padding:9px 12px;font:inherit;font-size:13px;letter-spacing:.5px}
+  .dz-confirm input:focus{border-color:var(--bad);outline:none}
+  .dz-note{font-size:11.5px;color:var(--dim);margin-top:12px;line-height:1.5}
+  section{max-width:760px;margin:18px auto;padding:0 18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+     padding:14px 16px;margin-bottom:10px}
+  .lbl{font-size:11px;letter-spacing:.9px;text-transform:uppercase;color:var(--dim);
+     margin:20px 0 8px 2px;font-weight:600}
+  .now .head{display:flex;align-items:baseline;gap:8px}
+  .now .t{font-weight:600;font-size:16px;overflow:hidden;text-overflow:ellipsis;
+     white-space:nowrap}
+  .now .sub{color:var(--dim);font-size:12.5px;margin-top:3px}
+  .bar{height:6px;background:#242933;border-radius:4px;margin-top:11px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--accent);border-radius:4px;
+     transition:width .6s linear}
+  .bar.indet i{width:35%;animation:slide 1.4s ease-in-out infinite}
+  @keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
+  .times{display:flex;justify-content:space-between;color:var(--dim);font-size:11.5px;
+     margin-top:6px;font-variant-numeric:tabular-nums}
+  .row{display:flex;align-items:center;gap:10px;padding:9px 2px;
+     border-bottom:1px solid var(--line)}
+  .row:last-child{border-bottom:0}
+  .row .n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .row .m{color:var(--dim);font-size:12px;flex:none;font-variant-numeric:tabular-nums}
+  .pill{font-size:10.5px;letter-spacing:.4px;text-transform:uppercase;padding:3px 7px;
+     border-radius:999px;background:#242933;color:var(--dim);flex:none;font-weight:600}
+  .pill.ok{background:rgba(30,215,96,.14);color:var(--accent)}
+  .pill.warn{background:rgba(245,165,36,.14);color:var(--warn)}
+  .pill.bad{background:rgba(244,91,91,.15);color:var(--bad)}
+  .empty{color:var(--dim);font-size:13.5px;padding:4px 2px}
+  button.mini{background:transparent;color:var(--dim);border:1px solid var(--line);
+     border-radius:8px;padding:0 10px;min-height:30px;font:600 12px/1 inherit;flex:none;
+     display:inline-flex;align-items:center;gap:5px;transition:color .12s,border-color .12s}
+  button.mini:hover{color:var(--fg);border-color:#3a4150}
+  button.mini:active{transform:scale(.95)}
+  button.mini.go{color:var(--accent);border-color:rgba(30,215,96,.35)}
+  .lblrow{display:flex;align-items:center;gap:10px;margin:20px 0 8px 2px}
+  .lblrow .lbl{margin:0}
+  .lblrow .sp{flex:1}
+  #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:24px;z-index:20;
+     background:var(--card2);border:1px solid var(--line);color:var(--fg);
+     padding:9px 16px;border-radius:999px;font-size:13px;opacity:0;pointer-events:none;
+     transition:opacity .2s,bottom .2s;box-shadow:0 8px 28px rgba(0,0,0,.45)}
+  #toast.on{opacity:1;bottom:34px}
+  #toast.bad{border-color:rgba(244,91,91,.5);color:var(--bad)}
+  .folder{color:var(--dim);font-size:11.5px}
+  .foot{max-width:760px;margin:26px auto 0;padding:0 18px;color:#5d6673;font-size:11.5px;
+     display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  a{color:var(--dim)}
+  .gear{background:transparent;border:0;color:var(--dim);font-size:17px;min-height:0;
+     padding:0 0 0 12px;cursor:pointer;line-height:1;flex:none;transition:color .15s,transform .3s}
+  .gear:hover{color:var(--fg)}
+  .gear.on{color:var(--accent);transform:rotate(90deg)}
+  .fld{padding:10px 2px;border-bottom:1px solid var(--line)}
+  .fld:last-of-type{border-bottom:0}
+  .fld label{display:block;font-size:12.5px;font-weight:600;margin-bottom:5px}
+  .fld .hint{color:var(--dim);font-size:11.5px;margin-bottom:6px}
+  .fld input,.fld select{width:100%;background:var(--card2);border:1px solid var(--line);
+     color:var(--fg);border-radius:9px;padding:9px 11px;font:13.5px/1.3 ui-monospace,
+     SFMono-Regular,Menlo,monospace;outline:none}
+  .fld input:focus,.fld select:focus{border-color:var(--accent)}
+  .fld .prow{display:flex;gap:7px;align-items:stretch}
+  .fld .prow input{flex:1}
+  .fld .prow button.mini{white-space:nowrap;padding:0 11px}
+  .fld.dirty input,.fld.dirty select{border-color:var(--warn)}
+  .prm{display:flex;gap:11px;align-items:flex-start;padding:11px 2px;
+     border-bottom:1px solid var(--line)}
+  .prm:last-child{border-bottom:0}
+  .prm .st{flex:none;width:19px;text-align:center;font-size:14px;line-height:1.45}
+  .prm .bd{flex:1;min-width:0}
+  .prm .nm{font-size:12.5px;font-weight:600}
+  .prm .hp{color:var(--dim);font-size:11.5px;margin-top:3px}
+  .prm .ac{flex:none;display:flex;gap:7px}
+  .prm.ok .nm{color:var(--accent)}
+  .cfgbar{display:flex;gap:9px;align-items:center;padding-top:13px}
+  .cfgbar .sp{flex:1}
+  .cfgbar .where{color:#5d6673;font-size:11px;font-family:ui-monospace,Menlo,monospace;
+     overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  @media (max-width:520px){ section,header .wrap{padding-left:14px;padding-right:14px} }
+</style></head><body>
+<header><div class="wrap">
+  <h1><span class="dot" id="dot"></span> Audio Downloader <small id="clock"></small>
+      <button class="gear" id="gear" title="Settings" type="button">&#9881;</button></h1>
+  <form id="f" autocomplete="off">
+    <textarea id="u" placeholder="Paste Spotify link — track, album or playlist (one per line)"
+      spellcheck="false"></textarea>
+    <button type="submit">Capture</button>
+  </form>
+</div></header>
+
+<section>
+  <div id="nowbox"></div>
+  <div class="lbl">Queue</div><div id="queue"></div>
+  <div class="lblrow">
+    <div class="lbl">Finished</div><div class="sp"></div>
+    <button class="mini go" id="openfolder">&#128193; Open folder</button>
+  </div>
+  <div id="recent"></div>
+</section>
+<section id="setup" hidden>
+  <div class="lblrow"><div class="lbl">Finish setup</div><div class="sp"></div>
+    <button class="mini" id="setupre" type="button">Re-check</button></div>
+  <div class="card">
+    <div class="dz-copy">Three macOS privacy switches. Apple won't let any installer
+      flip these &mdash; they have to be tapped by you, once per Mac, ever. Each button
+      opens the exact pane; find <b>Audio Downloader</b> in the list and turn it on.</div>
+    <div id="permrows"></div>
+    <div class="cfgbar"><div class="sp"></div>
+      <button class="mini" id="setupdone" type="button">Hide this</button></div>
+  </div>
+</section>
+<section id="settings" hidden>
+  <div class="lblrow"><div class="lbl">Settings</div><div class="sp"></div>
+    <button class="mini" id="cfgreveal" type="button">&#128269; Config file</button></div>
+  <div class="card" id="cfgcard"><div class="empty">loading…</div></div>
+
+  <div class="lblrow" style="margin-top:18px"><div class="lbl">Uninstall</div></div>
+  <div class="card danger">
+    <div class="dz-copy">
+      Removes the app, the background service, the engine, your settings, and the
+      <b id="dzdev">Multi-Output</b> audio device it creates. Your Mac's sound
+      output is put back to a real device first.
+    </div>
+    <label class="dz-check"><input type="checkbox" id="dzmusic">
+      Also delete my captured music <span class="dz-path" id="dzstore"></span></label>
+    <label class="dz-check"><input type="checkbox" id="dzdeps">
+      Also remove the shared tools <span class="dz-path">ffmpeg, yt-dlp, switchaudio-osx, blackhole-2ch</span></label>
+    <div class="dz-confirm">
+      <input type="text" id="dzword" placeholder="type UNINSTALL" autocomplete="off" spellcheck="false">
+      <button class="stop" id="dzgo" type="button">Uninstall</button>
+    </div>
+    <div class="dz-note">macOS keeps the Screen Recording and Automation permissions
+      until you remove them yourself in System Settings &#9656; Privacy &amp; Security.</div>
+  </div>
+</section>
+<div id="toast"></div>
+
+<div class="foot">
+  <span id="where"></span>
+  <a href="#" id="stoplink">stop current capture</a>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const mmss = s => { s = Math.max(0, Math.round(s||0));
+  return Math.floor(s/60) + ":" + String(s%60).padStart(2,"0"); };
+
+async function post(path, body){
+  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                              body: JSON.stringify(body||{})});
+  return r.json();
+}
+
+$("#f").addEventListener("submit", async e => {
+  e.preventDefault();
+  const t = $("#u").value.trim();
+  if(!t) return;
+  $("#u").value = "";
+  await post("/api/add", {text: t});
+  tick();
+});
+
+// paste a link anywhere -> straight into the box
+document.addEventListener("paste", e => {
+  if(document.activeElement === $("#u")) return;
+  const t = (e.clipboardData||window.clipboardData).getData("text");
+  if(t && /spotify|youtu|soundcloud/i.test(t)){ $("#u").value = t; $("#f").requestSubmit(); }
+});
+["dragover","dragenter"].forEach(ev => $("#u").addEventListener(ev, e => {
+  e.preventDefault(); $("#u").classList.add("drag"); }));
+["dragleave","drop"].forEach(ev => $("#u").addEventListener(ev, e =>
+  $("#u").classList.remove("drag")));
+$("#u").addEventListener("drop", e => {
+  e.preventDefault();
+  const t = e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text");
+  if(t){ $("#u").value = t; $("#f").requestSubmit(); }
+});
+$("#u").addEventListener("keydown", e => {
+  if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); $("#f").requestSubmit(); }
+});
+let toastT = null;
+function toast(msg, bad){
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "on" + (bad ? " bad" : "");
+  clearTimeout(toastT);
+  toastT = setTimeout(() => t.className = "", 2200);
+}
+
+async function reveal(path, select){
+  try{
+    const r = await post("/api/reveal", {path: path, select: select !== false});
+    toast(r.ok ? (select === false ? "Folder opened" : "Revealed in Finder") : r.msg, !r.ok);
+  }catch(e){ toast("couldn't reach the app", true); }
+}
+
+$("#openfolder").addEventListener("click", () => reveal(null, false));
+
+// ---------------------------------------------------------------- settings
+let CFG_FIELDS = [];
+
+function dzFill(d){
+  const find = k => (d.fields || []).find(f => f.key === k) || {};
+  const store = find("storage_dir").resolved || "";
+  const dev = find("multi_output_name").value || "Multi-Output";
+  $("#dzstore").textContent = store ? "(" + store + ")" : "";
+  $("#dzdev").textContent = dev;
+}
+
+// ------------------------------------------------------------- first-run
+const PERM_ICON = {ok:"\u2705", denied:"\u274c", unknown:"\u2753"};
+function permRender(d){
+  $("#permrows").innerHTML = d.items.map(p => `
+    <div class="prm ${p.status === "ok" ? "ok" : ""}">
+      <div class="st">${PERM_ICON[p.status] || "?"}</div>
+      <div class="bd"><div class="nm">${esc(p.label)}</div>
+        <div class="hp">${esc(p.help)}</div></div>
+      <div class="ac">
+        ${p.key === "spotify" ? `<button class="mini" data-chk="${p.key}">Check</button>` : ""}
+        <button class="mini${p.status === "ok" ? "" : " go"}" data-open="${p.key}">Open</button>
+      </div>
+    </div>`).join("");
+  $("#permrows").querySelectorAll("button[data-open]").forEach(b =>
+    b.addEventListener("click", async () => {
+      const r = await post("/api/perms/open", {key: b.dataset.open});
+      toast(r.ok ? "System Settings opened \u2014 flip it on, then Re-check" : r.msg, !r.ok);
+    }));
+  $("#permrows").querySelectorAll("button[data-chk]").forEach(b =>
+    b.addEventListener("click", async () => {
+      b.disabled = true; const w = b.textContent; b.textContent = "\u2026";
+      try { permRender(await post("/api/perms/check", {key: b.dataset.chk})); }
+      catch(e){ toast("check failed", true); b.disabled = false; b.textContent = w; }
+    }));
+  $("#setup").hidden = !(d.show || SETUP_FORCED);
+  if (d.all_ok && SETUP_FORCED) toast("all three are on \u2014 you're set");
+}
+let SETUP_FORCED = false;
+async function permLoad(force){
+  if (force) SETUP_FORCED = true;
+  try { permRender(await (await fetch("/api/perms", {cache:"no-store"})).json()); }
+  catch(e){ }
+}
+
+function cfgRender(d){
+  CFG_FIELDS = d.fields;
+  dzFill(d);
+  const devs = d.devices || [];
+  const rows = d.fields.map(f => {
+    const id = "cf_" + f.key.replace(/\./g, "_");
+    let input;
+    if (f.kind === "device" && devs.length){
+      const opts = devs.map(x =>
+        `<option${x === f.value ? " selected" : ""}>${esc(x)}</option>`).join("");
+      const miss = devs.includes(f.value) ? "" :
+        `<option selected>${esc(f.value)}</option>`;
+      input = `<select id="${id}" data-key="${esc(f.key)}">${miss}${opts}</select>`;
+    } else {
+      input = `<input id="${id}" data-key="${esc(f.key)}" spellcheck="false"
+        value="${esc(f.value)}" placeholder="${f.kind === "path?" ? "blank = off" : ""}">`;
+      if (f.kind === "path" || f.kind === "path?"){
+        // A real Finder picker beats hand-typing a path into a text box.
+        const mode = f.key === "log_file" ? "file" : "folder";
+        input = `<div class="prow">${input}<button class="mini" type="button"
+          data-pick="${esc(id)}" data-mode="${mode}">Browse…</button></div>`;
+      }
+    }
+    return `<div class="fld" data-f="${esc(f.key)}">
+      <label for="${id}">${esc(f.label)}</label>
+      <div class="hint">${esc(f.help)}</div>${input}</div>`;
+  }).join("");
+  $("#cfgcard").innerHTML = rows + `
+    <div class="cfgbar">
+      <button class="mini go" id="cfgsave" type="button">Save</button>
+      <button class="mini" id="cfgreset" type="button">Revert</button>
+      <div class="sp"></div>
+      <span class="where" title="${esc(d.path)}">${esc(d.path)}</span>
+    </div>`;
+  $("#cfgcard").querySelectorAll("input,select").forEach(el => {
+    el.addEventListener("input", () => {
+      const f = CFG_FIELDS.find(x => x.key === el.dataset.key);
+      el.closest(".fld").classList.toggle("dirty", f && el.value !== f.value);
+    });
+  });
+  $("#cfgcard").querySelectorAll("button[data-pick]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const el = document.getElementById(btn.dataset.pick);
+      btn.disabled = true; const was = btn.textContent; btn.textContent = "…";
+      try {
+        const r = await post("/api/pick", {mode: btn.dataset.mode, start: el.value});
+        if (r.ok && r.path){
+          el.value = r.path;
+          el.dispatchEvent(new Event("input"));
+        } else if (!r.ok && r.msg){ toast(r.msg, true); }
+      } catch(e){ toast("picker failed", true); }
+      btn.disabled = false; btn.textContent = was;
+    });
+  });
+  $("#cfgsave").addEventListener("click", cfgSave);
+  $("#cfgreset").addEventListener("click", cfgLoad);
+}
+
+async function cfgLoad(){
+  try {
+    cfgRender(await (await fetch("/api/config")).json());
+  } catch(e){
+    $("#cfgcard").innerHTML = `<div class="empty">couldn't read config</div>`;
+  }
+}
+
+async function cfgSave(){
+  const values = {};
+  $("#cfgcard").querySelectorAll("input,select").forEach(el => {
+    const f = CFG_FIELDS.find(x => x.key === el.dataset.key);
+    if (f && el.value !== f.value) values[el.dataset.key] = el.value;
+  });
+  if (!Object.keys(values).length) return toast("nothing changed");
+  const btn = $("#cfgsave"); btn.disabled = true; btn.textContent = "Saving…";
+  const r = await post("/api/config", {values: values});
+  btn.disabled = false; btn.textContent = "Save";
+  toast(r.msg, !r.ok);
+  if (r.ok && r.restart){
+    // our own server is bouncing -- wait for it to answer again, then reload
+    setTimeout(async function wait(n){
+      for (let i = 0; i < 40; i++){
+        try { const h = await fetch("/health", {cache:"no-store"});
+              if (h.ok) return location.reload(); } catch(e){}
+        await new Promise(r2 => setTimeout(r2, 400));
+      }
+      location.reload();
+    }, 900);
+  } else if (r.ok){
+    cfgLoad();
+  }
+}
+
+$("#gear").addEventListener("click", () => {
+  const sec = $("#settings"), open = sec.hasAttribute("hidden");
+  sec.toggleAttribute("hidden", !open);
+  $("#gear").classList.toggle("on", open);
+  if (open){ cfgLoad(); sec.scrollIntoView({behavior:"smooth", block:"nearest"}); }
+});
+$("#setupre").addEventListener("click", async () => {
+  const btn = $("#setupre"); btn.disabled = true; btn.textContent = "\u2026";
+  try { permRender(await post("/api/perms/check", {key: "spotify"})); }
+  finally { btn.disabled = false; btn.textContent = "Re-check"; }
+});
+$("#setupdone").addEventListener("click", async () => {
+  await post("/api/perms/dismiss", {dismissed: true});
+  SETUP_FORCED = false; $("#setup").hidden = true;
+  toast("hidden \u2014 reopen it from localhost:" + location.port + "/#setup");
+});
+permLoad(location.hash === "#setup");
+if (location.hash === "#setup") $("#setup").hidden = false;
+
+// deep link: http://localhost:PORT/#settings opens straight into the panel
+if (location.hash === "#settings") $("#gear").click();
+
+// ---------------------------------------------------------------- uninstall
+$("#dzword").addEventListener("input", () => {
+  $("#dzgo").disabled = $("#dzword").value.trim().toUpperCase() !== "UNINSTALL";
+});
+$("#dzgo").disabled = true;
+
+$("#dzgo").addEventListener("click", async () => {
+  const btn = $("#dzgo");
+  btn.disabled = true; btn.textContent = "Uninstalling…";
+  let r;
+  try{
+    r = await post("/api/uninstall", {
+      confirm: $("#dzword").value.trim(),
+      purge_music: $("#dzmusic").checked,
+      remove_deps: $("#dzdeps").checked,
+    });
+  }catch(e){
+    btn.disabled = false; btn.textContent = "Uninstall";
+    return toast("couldn't reach the app", true);
+  }
+  if (!r.ok){
+    btn.disabled = false; btn.textContent = "Uninstall";
+    return toast(r.msg, true);
+  }
+  // The server is about to be stopped by the script it just spawned, so there
+  // is nothing left to poll and no page to go back to. Say so and stop.
+  document.body.innerHTML =
+    '<div style="max-width:520px;margin:18vh auto;padding:0 20px;text-align:center;' +
+    'font:15px/1.6 -apple-system,BlinkMacSystemFont,sans-serif;color:#e8eaed">' +
+    '<div style="font-size:34px;margin-bottom:14px">&#128075;</div>' +
+    '<div style="font-size:19px;font-weight:600;margin-bottom:10px">Uninstalling</div>' +
+    '<div style="color:#8a919c">The background service is stopping and everything ' +
+    'is being removed. You can close this window.</div>' +
+    '<div style="color:#8a919c;margin-top:18px;font-size:12.5px">Log: ' +
+    esc(r.msg) + '</div></div>';
+});
+
+$("#cfgreveal").addEventListener("click", async () => {
+  const d = await (await fetch("/api/config")).json();
+  reveal(d.path, true);
+});
+
+
+// delegated: every per-file Finder button in the Finished list
+$("#recent").addEventListener("click", e => {
+  const b = e.target.closest("button[data-reveal]");
+  if(!b) return;
+  reveal(b.getAttribute("data-reveal"), b.hasAttribute("data-file"));
+});
+
+$("#stoplink").addEventListener("click", async e => {
+  e.preventDefault();
+  if(!confirm("Stop the current capture and clear the queue?")) return;
+  await post("/api/stop", {}); tick();
+});
+
+function nowCard(s){
+  const n = s.now;
+  if(!n){
+    const pend = s.submits.filter(x => x.status === "sending").length;
+    return `<div class="card"><div class="empty">${pend ? "starting…" :
+      "Idle — nothing capturing."}</div></div>`;
+  }
+  const head = n.track ? esc(n.track) : (n.stage === "next track…" ? "moving to next track…" : "starting…");
+  const bits = [];
+  if(n.container) bits.push(esc(n.kind||"set") + ": " + esc(n.container));
+  if(n.done_count) bits.push(n.done_count + " done this run");
+  bits.push("pid " + n.pid);
+  const pct = (n.percent === null || n.percent === undefined) ? null : n.percent;
+  const bar = pct === null
+    ? `<div class="bar indet"><i></i></div>`
+    : `<div class="bar"><i style="width:${pct}%"></i></div>
+       <div class="times"><span>${mmss(n.elapsed)}</span><span>${pct.toFixed(0)}%</span>
+       <span>${mmss(n.duration)}</span></div>`;
+  return `<div class="card now"><div class="head"><div class="t">🎙 ${head}</div></div>
+    <div class="sub">${bits.join(" · ")}</div>${bar}</div>`;
+}
+
+const PILL = {sending:"", queued:"", capturing:"ok", done:"ok", skipped:"warn",
+              rejected:"bad", error:"bad"};
+function queueCard(s){
+  const rows = [];
+  const now = Date.now()/1000;
+  s.submits.filter(x => x.status !== "capturing" &&
+                        (!x.finished || now - x.finished < 300))
+    .forEach(x => {
+      // A finished or skipped submit carries the file it resolved to, so give
+      // it the same reveal button as the Finished list. For a skip that is the
+      // only way to see what it matched: the file keeps its original date and
+      // may be far too old to show up below.
+      const rev = x.path
+        ? `<button class="mini" data-file data-reveal="${esc(x.path)}"
+             title="Reveal in Finder">&#128269;</button>` : "";
+      rows.push(`<div class="row"><div class="n">${esc(x.url)}
+        ${x.result ? `<div class="folder">${esc(x.result)}</div>` : ""}</div>
+        <span class="pill ${PILL[x.status]||""}">${esc(x.status)}</span>${rev}</div>`);
+    });
+  s.queue.forEach((q,i) => rows.push(`<div class="row"><div class="n">${esc(q.label || q.url)}</div>
+      <span class="m">#${i+1}</span></div>`));
+  if(!rows.length) return `<div class="card"><div class="empty">Queue empty.</div></div>`;
+  return `<div class="card">${rows.join("")}</div>`;
+}
+
+function recentCard(s){
+  if(!s.recent.length) return `<div class="card"><div class="empty">Nothing captured yet.</div></div>`;
+  const rows = s.recent.map(f => {
+    const fresh = f.age < 900 ? `<span class="pill ok">new</span>` : "";
+    const fold = f.folder ? `<div class="folder">${esc(f.folder)}/</div>` : "";
+    return `<div class="row"><div class="n">${esc(f.name)}${fold}</div>
+      ${fresh}<span class="m">${f.mb} MB · ${esc(f.when)}</span>
+      <button class="mini" data-file data-reveal="${esc(f.path)}"
+        title="Reveal in Finder">&#128269;</button></div>`;
+  });
+  return `<div class="card">${rows.join("")}</div>`;
+}
+
+let failures = 0;
+async function tick(){
+  try{
+    const s = await (await fetch("/api/status")).json();
+    failures = 0;
+    $("#dot").className = "dot" + (s.capturing ? " live" : "");
+    $("#clock").textContent = s.time;
+    $("#nowbox").innerHTML = nowCard(s);
+    $("#queue").innerHTML  = queueCard(s);
+    $("#recent").innerHTML = recentCard(s);
+    $("#where").textContent = "files land in " + s.storage_pretty +
+      (s.mirrors && s.mirrors.length ? " (+ " + s.mirrors.length + " mirror" +
+       (s.mirrors.length > 1 ? "s" : "") + ")" : "");
+    document.title = s.capturing
+      ? "🎙 " + (s.now && s.now.track ? s.now.track : "capturing") + " — Audio Downloader"
+      : "Audio Downloader";
+  }catch(e){
+    if(++failures > 2) $("#clock").textContent = "app offline";
+  }
+}
+tick(); setInterval(tick, 1500);
+</script></body></html>
+"""
+
+
+# ----------------------------------------------------------------- http layer
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "AudioDownloader/1.0"
+
+    def log_message(self, fmt, *a):      # keep stdout clean under launchd
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/":
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        if path == "/api/status":
+            return self._send(200, json.dumps(status_payload()))
+        if path == "/api/config":
+            return self._send(200, json.dumps(config_payload()))
+        if path == "/api/perms":
+            return self._send(200, json.dumps(perms_payload()))
+        if path == "/health":
+            return self._send(200, "ok", "text/plain")
+        self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        except (ValueError, json.JSONDecodeError):
+            payload = {}
+        if path == "/api/add":
+            res = submit(payload.get("text", ""))
+            return self._send(200, json.dumps({"added": res}))
+        if path == "/api/reveal":
+            tgt = payload.get("path") or str(STORAGE)
+            ok, msg = reveal(tgt, select=bool(payload.get("select", True)))
+            return self._send(200, json.dumps({"ok": ok, "msg": msg}))
+        if path == "/api/pick":
+            # The Finder panel opens on the Mac's screen, so a request from
+            # anywhere else would pop a dialog nobody can see. Loopback only.
+            if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                return self._send(200, json.dumps(
+                    {"ok": False, "msg": "open this page on the Mac to browse"}))
+            ok, res = pick_path(payload.get("mode") or "folder",
+                                payload.get("start") or "")
+            return self._send(200, json.dumps(
+                {"ok": ok, "path": res if ok else "", "msg": "" if ok else res}))
+        if path == "/api/config":
+            ok, msg, restart = config_save(payload.get("values") or {})
+            if ok and restart and payload.get("restart", True):
+                self._send(200, json.dumps({"ok": ok, "msg": msg + " — restarting",
+                                            "restart": True}))
+                self_restart()
+                return
+            return self._send(200, json.dumps({"ok": ok, "msg": msg, "restart": False}))
+        if path == "/api/perms/open":
+            ok, msg = perms_open(payload.get("key") or "")
+            return self._send(200, json.dumps({"ok": ok, "msg": msg}))
+        if path == "/api/perms/check":
+            return self._send(200, json.dumps(
+                perms_payload(active=payload.get("key") or None)))
+        if path == "/api/perms/dismiss":
+            _setup_write({"dismissed": bool(payload.get("dismissed", True))})
+            return self._send(200, json.dumps({"ok": True}))
+        if path == "/api/uninstall":
+            # There is no authentication on this server. It binds loopback by
+            # default, but the host is configurable, so the one destructive
+            # endpoint refuses anything that is not local regardless.
+            #
+            # The message matters. When this page was reachable at a LAN
+            # address, opening it there and clicking Uninstall *at the Mac*
+            # arrived from the LAN IP and got told to "run it on the Mac
+            # itself" — technically true, unactionable, and infuriating. Name
+            # the actual problem: the page, not the person.
+            if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                applog(f"uninstall refused from {self.client_address[0]}")
+                return self._send(200, json.dumps(
+                    {"ok": False,
+                     "msg": (f"this page is open at a network address "
+                             f"({self.client_address[0]}). Reopen the app, or go to "
+                             f"http://localhost:{PORT}, and try again.")}))
+            # Typed confirmation, not just a button press: this is the one
+            # action in the app that cannot be undone from inside the app.
+            if (payload.get("confirm") or "").strip().upper() != "UNINSTALL":
+                return self._send(200, json.dumps(
+                    {"ok": False, "msg": "type UNINSTALL to confirm"}))
+            ok, msg = uninstall_spawn(bool(payload.get("purge_music")),
+                                      bool(payload.get("remove_deps")))
+            return self._send(200, json.dumps({"ok": ok, "msg": msg}))
+        if path == "/api/stop":
+            try:
+                r = subprocess.run(RECORD_AUDIO_CMD + ["stop"],
+                                   capture_output=True, text=True, timeout=45)
+                applog(f"stop -> rc={r.returncode} {r.stdout.strip()!r}")
+                return self._send(200, json.dumps({"ok": True, "out": r.stdout.strip()}))
+            except Exception as e:
+                return self._send(200, json.dumps({"ok": False, "out": f"{type(e).__name__}: {e}"}))
+        self._send(404, json.dumps({"error": "not found"}))
+
+
+class DualStackServer(ThreadingHTTPServer):
+    """Bind :: with V6ONLY off so one socket answers IPv4 *and* IPv6.
+
+    Only reachable by setting server.host to a wildcard, which is not the
+    default. Kept because a host with both an A and an AAAA record resolves
+    to the AAAA first on some clients, and an IPv4-only bind then looks dead
+    at the hostname while the raw IPv4 address works.
+    """
+
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError:
+            pass
+        return super().server_bind()
+
+
+def main():
+    if not RECORD_AUDIO.exists():
+        raise SystemExit(f"record-audio not found at {RECORD_AUDIO}")
+    applog(f"config: {CFG.path}  storage: {STORAGE}")
+    threading.Thread(target=watch_submits, daemon=True).start()
+    ThreadingHTTPServer.allow_reuse_address = True
+    # Loopback (the default) is a plain IPv4 bind. The dual-stack socket is
+    # only for the wildcard case, which nothing ships with -- see the class.
+    if HOST in ("0.0.0.0", "::", ""):
+        try:
+            srv = DualStackServer(("::", PORT), Handler)
+        except OSError:
+            srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    else:
+        srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    applog(f"audio-downloader listening on {HOST}:{PORT}")
+    print(f"audio-downloader → http://localhost:{PORT}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+
+
+if __name__ == "__main__":
+    main()

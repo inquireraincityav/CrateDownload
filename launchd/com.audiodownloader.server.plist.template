@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.audiodownloader.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__BIN__/audio-downloader</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>__SUPPORT__/audio-downloader.out.log</string>
+  <key>StandardErrorPath</key><string>__SUPPORT__/audio-downloader.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__BIN__:__BREW__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>AUDIO_DOWNLOADER_LABEL</key><string>com.audiodownloader.server</string>
+    <key>AUDIO_DOWNLOADER_CONFIG</key><string>__CONFIG__</string>
+  </dict>
+</dict>
+</plist>

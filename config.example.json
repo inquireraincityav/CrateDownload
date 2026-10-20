@@ -1,0 +1,39 @@
+{
+  "_comment": "Audio Downloader. Paths accept ~ and $VARS. Empty tool/helper strings are auto-discovered on PATH. Everything here is editable from the app's gear menu.",
+  "storage_dir": "~/Music/Audio Downloader",
+  "mirrors": {
+    "captures": null,
+    "downloads": null
+  },
+  "state_dir": "~/Library/Application Support/Audio Downloader/state",
+  "log_file": "~/Library/Application Support/Audio Downloader/capture.log",
+  "silent_output_device": "BlackHole 2ch",
+  "multi_output_name": "Audio Downloader",
+  "launchd_prefix": "com.audiodownloader",
+  "tools": {
+    "switchaudiosource": "",
+    "ffmpeg": "",
+    "ffprobe": "",
+    "yt_dlp": ""
+  },
+  "helpers": {
+    "avrec": "",
+    "avrec_app": "",
+    "spotify_ctl": "",
+    "multiout": "",
+    "ensure_rate": ""
+  },
+  "server": { "host": "127.0.0.1", "port": 8765 },
+  "notify": {
+    "prefix": "",
+    "desktop": { "enabled": true },
+    "telegram": {
+      "enabled": false, "token": "", "chat_id": "",
+      "token_file": "", "chat_id_file": "",
+      "send_audio_helper": "", "autosend_captures": false
+    },
+    "imessage": {
+      "enabled": false, "recipient": "", "attach_helper": "", "send_lock": ""
+    }
+  }
+}

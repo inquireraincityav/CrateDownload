@@ -1,0 +1,2241 @@
+#!/usr/bin/env python3
+"""record-audio — system audio capture via BlackHole + URL routing.
+
+Usage:
+    record-audio                              # start indefinite raw capture
+    record-audio start [name]                 # same, with optional name
+    record-audio stop                         # stop current + drop queue
+    record-audio 5m                           # raw capture for 5 minutes
+    record-audio <url>                        # YT/SC/Spotify routing
+    record-audio mute                         # mute system speakers
+    record-audio unmute                       # unmute speakers
+    record-audio list                         # recent files
+    record-audio queue                        # show queue
+
+Routing:
+    youtube.com / youtu.be    -> yt-dlp direct
+    soundcloud.com            -> yt-dlp direct
+    open.spotify.com / spotify: -> Spotify.app capture
+    no URL                    -> raw BlackHole capture
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+from pathlib import Path as pathlib_Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import adcfg  # noqa: E402  (shared config layer — see adcfg.py)
+
+CFG = adcfg.SETTINGS
+
+HOME = Path.home()
+STORAGE = CFG.storage
+MIRROR_CAPTURES = CFG.mirror_captures      # None disables the mirror
+MIRROR_DOWNLOADS = CFG.mirror_downloads
+STATE_DIR = CFG.state_dir
+# Fixed-path Spotify AppleScript bridge. macOS keys the Automation TCC grant to
+# the sending binary's path; claude's path changes every update (grant drops),
+# but spotify-ctl's never does — approve its prompt once, survives forever.
+SPOTIFY_CTL = CFG.spotify_ctl
+SEG_DIR = STATE_DIR / "rec-segments"
+PIDFILE = STATE_DIR / "record-audio.pid"
+STATEFILE = STATE_DIR / "record-audio.json"
+QUEUEFILE = STATE_DIR / "rec-queue.json"
+LOGFILE = CFG.log_file
+MULTIOUT_NAME = CFG.multi_output
+SWITCH = CFG.switch
+FFMPEG = CFG.ffmpeg
+FFPROBE = CFG.ffprobe
+YTDLP = CFG.ytdlp
+IMSG_LOCK = CFG.im_send_lock
+ATTACH_MAX_BYTES = 25 * 1024 * 1024
+SIG = CFG.prefix
+
+CFG.ensure_dirs()
+for d in (STORAGE, STATE_DIR, SEG_DIR, LOGFILE.parent):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+def log(msg):
+    try:
+        with open(LOGFILE, "a") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [record-audio] {msg}\n")
+    except OSError:
+        pass
+
+
+_SAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize(name, fallback="track"):
+    s = _SAFE.sub("_", (name or "")).strip().strip(".")
+    s = re.sub(r"\s+", " ", s)
+    return s[:200] or fallback
+
+
+def unique_path(p):
+    if not p.exists():
+        return p
+    base, ext = p.stem, p.suffix
+    n = 2
+    while True:
+        cand = p.with_name(f"{base} ({n}){ext}")
+        if not cand.exists():
+            return cand
+        n += 1
+
+
+def osa(script, timeout=10):
+    # Spotify-targeted AppleScript is routed through the fixed-path spotify-ctl
+    # binary so the Automation TCC grant survives Claude version updates. Any
+    # other AppleScript still goes direct via osascript.
+    if 'application "Spotify"' in script and SPOTIFY_CTL and Path(SPOTIFY_CTL).exists():
+        try:
+            r = subprocess.run(
+                [str(SPOTIFY_CTL), "raw", script],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if r.returncode in (0, 1):  # 0 ok; 1 = AppleScript runtime err (e.g. -1728)
+                return r.stdout.strip()
+            log(f"spotify-ctl rc={r.returncode}: {r.stderr.strip()} — falling back to osascript")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"spotify-ctl fail: {e} — falling back to osascript")
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return r.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"osa fail: {e}")
+        return ""
+
+
+_SEND_TEXT_OSA = """
+on run argv
+    set tmpFile to item 1 of argv
+    set msgText to do shell script "cat " & quoted form of tmpFile
+    with timeout of 15 seconds
+        tell application "Messages"
+            set targetService to 1st service whose service type = iMessage
+            set targetBuddy to buddy (item 2 of argv) of targetService
+            try
+                set targetChat to 1st chat whose participants contains targetBuddy
+                send msgText to targetChat
+            on error
+                send msgText to targetBuddy
+            end try
+        end tell
+    end timeout
+end run
+"""
+
+_SEND_FILE_OSA = """
+on run argv
+    set filePath to item 1 of argv
+    set theFile to POSIX file filePath as alias
+    with timeout of 60 seconds
+        tell application "Messages"
+            set targetService to 1st service whose service type = iMessage
+            set targetBuddy to buddy (item 2 of argv) of targetService
+            try
+                set targetChat to 1st chat whose participants contains targetBuddy
+                send theFile to targetChat
+            on error
+                send theFile to targetBuddy
+            end try
+        end tell
+    end timeout
+end run
+"""
+
+
+def send_imsg(text):
+    """Recording status/update pings.
+
+    Policy 2026-06-09 (Gurinder): ALL recording update messages route to
+    Telegram only — iMessage no longer receives capture status. The name is
+    kept as `send_imsg` so the ~16 call sites stay stable; the body now
+    delegates to Telegram sendMessage via tg_send_text(). The originating-channel
+    command echo (record-audio's stdout, echoed by the watcher) is unaffected.
+    """
+    if not text:
+        return
+    desktop_notify(text)
+    tg_send_text(text)
+    im_send_text(text)
+
+
+def desktop_notify(text):
+    """Notification Centre banner. On by default and entirely local — this is
+    the only status channel a fresh install has, so a capture finishing is
+    still visible with no account, token or helper configured."""
+    if not (CFG.desktop_enabled and text):
+        return
+    body = " ".join(str(text).split())[:220]
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             'on run argv\n display notification (item 1 of argv) '
+             'with title "Audio Downloader"\nend run', body],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        log(f"desktop_notify error: {e}")
+
+
+_SENT_LEDGER = STATE_DIR / "imsg-sent-files.json"
+_DUP_WINDOW_S = 60  # refuse same path twice within this window
+
+
+def _ledger_load():
+    try:
+        return json.loads(_SENT_LEDGER.read_text()) if _SENT_LEDGER.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _ledger_record(path_str):
+    d = _ledger_load()
+    now = time.time()
+    # Prune old entries while we're here.
+    d = {k: v for k, v in d.items() if now - v < 24 * 3600}
+    d[path_str] = now
+    try:
+        _SENT_LEDGER.write_text(json.dumps(d))
+    except OSError:
+        pass
+
+
+def mirror_to_icloud(src: Path, dst_root):
+    """Copy a captured file to an iCloud archive root, preserving the file's
+    relative path under STORAGE. Best-effort: any failure is logged but never
+    raised — the capture flow must not depend on iCloud being healthy.
+    Spotify captures pass MIRROR_CAPTURES; yt-dlp passes MIRROR_DOWNLOADS.
+    A configured value of null/"" disables the mirror entirely."""
+    if not dst_root:
+        return
+    dst_root = Path(dst_root)
+    try:
+        rel = src.relative_to(STORAGE)
+    except ValueError:
+        log(f"icloud mirror: {src} not under STORAGE, skipping")
+        return
+    dst = dst_root / rel
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        log(f"icloud mirror: {dst_root.name}/{rel}")
+    except Exception as e:
+        log(f"icloud mirror FAIL: {dst_root.name}/{rel}: {type(e).__name__}: {e}")
+
+
+def send_imsg_attach(path):
+    """Send a file via the cliclick + pbcopy + open recipe (memory-blessed primary).
+    Single-attempt: returns even on verify failure — caller MUST NOT retry.
+    Uses ~/.claude/state/imsg-sent-files.json as a duplicate guard so the same
+    path can't be sent twice within `_DUP_WINDOW_S` seconds (prevents accidental
+    double-sends from overlapping code paths)."""
+    if not CFG.im_enabled:
+        return
+    if not path.exists():
+        log(f"send_imsg_attach: missing {path}")
+        return
+    p_str = str(path)
+    last = _ledger_load().get(p_str, 0)
+    if time.time() - last < _DUP_WINDOW_S:
+        log(f"send_imsg_attach: SKIP duplicate within {_DUP_WINDOW_S}s — {path.name}")
+        return
+    helper = CFG.im_attach_helper
+    if not helper or not helper.exists():
+        log(f"send_imsg_attach: helper missing at {helper}")
+        return
+    _ledger_record(p_str)
+    try:
+        r = subprocess.run(
+            ([str(IMSG_LOCK)] if IMSG_LOCK and IMSG_LOCK.exists() else []) + [str(helper), p_str],
+            capture_output=True, text=True, timeout=45,
+        )
+        if r.returncode != 0:
+            log(f"send_imsg_attach: rc={r.returncode} stderr={r.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        log(f"send_imsg_attach: timeout sending {path.name}")
+
+
+TELEGRAM_AUDIO = CFG.tg_audio_helper
+
+# Delivery policy 2026-07-26 (Gurinder): "Moving forward, you don't have to
+# share capture files in Telegram. Just leave them in blackhole. Spotify
+# captures to be specific. If I really want a file here, I'll ask."
+# Spotify captures now land on disk (+ iCloud mirror) and stop there — no
+# auto-push. yt-dlp rips and raw !rec captures still auto-send.
+# Now config-driven: notify.telegram.autosend_captures
+SPOTIFY_AUTOSEND = CFG.tg_autosend
+
+
+def im_send_text(text):
+    """Optional iMessage status ping. Off unless notify.imessage.enabled and a
+    recipient is configured. Never raises."""
+    if not (CFG.im_enabled and CFG.im_recipient and text):
+        return
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write(text)
+            tmp = fh.name
+        subprocess.run(["osascript", "-e", _SEND_TEXT_OSA, tmp, CFG.im_recipient],
+                       capture_output=True, text=True, timeout=25)
+        os.unlink(tmp)
+    except Exception as e:
+        log(f"im_send_text error: {e}")
+
+
+def tg_send_text(text):
+    """Send a plain status/update message to the locked Telegram chat via
+    sendMessage. Single attempt, curl-based (no extra Python deps), never raises.
+    Backs the 2026-06-09 Telegram-only policy for all record-audio updates."""
+    if not text:
+        return
+    token, chat_id = CFG.telegram_creds()
+    if not (token and chat_id):
+        return
+    try:
+        r = subprocess.run(
+            ["/usr/bin/curl", "-sS", "--max-time", "20",
+             f"https://api.telegram.org/bot{token}/sendMessage",
+             "--data-urlencode", f"chat_id={chat_id}",
+             "--data-urlencode", f"text={text}"],
+            capture_output=True, text=True, timeout=25,
+        )
+        if r.returncode != 0:
+            log(f"tg_send_text rc={r.returncode}: {r.stderr.strip()[:200]}")
+    except Exception as e:
+        log(f"tg_send_text error: {e}")
+
+
+def tg_send_audio(path, caption=""):
+    """Deliver a captured track to Telegram via sendAudio (the reliable, always-on
+    pipe — unlike iMessage it has no UI-automation fragility, so it fires regardless
+    of Ableton state). Single attempt; logs the outcome; never raises."""
+    try:
+        path = Path(path)
+        if not path.is_file():
+            return
+        if not CFG.tg_enabled:
+            return
+        if not TELEGRAM_AUDIO or not TELEGRAM_AUDIO.exists():
+            log(f"tg_send_audio: helper missing at {TELEGRAM_AUDIO}")
+            return
+        cmd = [str(TELEGRAM_AUDIO), str(path)]
+        if caption:
+            cmd += ["--caption", caption]
+        # 600s: telegram-send-audio now burns up to 3 transport attempts
+        # (3×180s read timeout + 24s backoff ≈ 9.5min) before giving up.
+        # A 320s cap here would kill it mid-retry and lose the self-report.
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            err = r.stderr.strip()[:200]
+            log(f"tg_send_audio rc={r.returncode} for {path.name}: {err}")
+            # Guardrail 2026-07-24 (Gold Coast broken-pipe): a failed delivery
+            # must self-report immediately — don't wait for Gurinder to ask.
+            # Text send is tiny and usually survives when the big upload dies.
+            # Single-attempt rule: report + wait, never auto-resend the audio.
+            tg_send_text(
+                f"⚠️ {path.name} captured fine — it's safe on disk — but "
+                f"the Telegram upload failed ({err or 'unknown error'}). "
+                f"Say 'resend' when you want it re-fired.")
+    except Exception as e:
+        log(f"tg_send_audio error for {path}: {e}")
+        try:
+            tg_send_text(
+                f"⚠️ {Path(path).name} captured but the Telegram upload "
+                f"errored ({e}). Say 'resend' when you want it re-fired.")
+        except Exception:
+            pass
+
+
+def sw_outputs():
+    r = subprocess.run([SWITCH, "-a", "-t", "output"], capture_output=True, text=True)
+    return [l for l in r.stdout.splitlines() if l.strip()]
+
+
+def sw_current_output():
+    r = subprocess.run([SWITCH, "-c", "-t", "output"], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def sw_set_output(name):
+    r = subprocess.run([SWITCH, "-s", name, "-t", "output"], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"sw_set_output {name!r} rc={r.returncode} stderr={r.stderr.strip()}")
+    return r.returncode == 0
+
+
+def system_muted():
+    return osa("output muted of (get volume settings)") == "true"
+
+
+def set_muted(b):
+    osa(f"set volume output muted {str(b).lower()}")
+
+
+def spotify_running():
+    return osa('tell application "System Events" to (name of processes) contains "Spotify"') == "true"
+
+
+# Hard rule (Gurinder 2026-06-01, extended 2026-07-11): ALL Spotify recording
+# sessions are silent on the speakers — originally Ableton-open only, now
+# unconditional per Gurinder ("moving forward make all spotify captures
+# muted"). We route the default output to the silent BlackHole 2ch device for
+# the capture; avrec-app (ScreenCaptureKit) taps Spotify the *app* directly,
+# so the recording is unaffected, and a DAW on its own device (e.g. Ableton
+# on an audio interface) keeps monitoring live.
+SILENT_OUTPUT = CFG.silent_output
+SILENCED_FROM_FILE = STATE_DIR / "record-audio.silenced-from"
+SPOTIFY_VOL_FILE = STATE_DIR / "record-audio.spotify-volume"
+
+
+def begin_spotify_silence():
+    """Route the system default output to the silent BlackHole 2ch device so
+    the Spotify capture is inaudible on the speakers (SCK still taps the app,
+    so the recording is unaffected). Unconditional since 2026-07-11. The prior
+    output is persisted to SILENCED_FROM_FILE so it restores even if the
+    capture is SIGTERM-killed (which skips finally blocks). Returns True if
+    silenced."""
+    if SILENT_OUTPUT not in sw_outputs():
+        log(f"WARN: {SILENT_OUTPUT!r} unavailable; capture will be audible")
+        return False
+    prior = sw_current_output()
+    if prior == SILENT_OUTPUT:
+        return False  # already silent; nothing to change or restore
+    if not sw_set_output(SILENT_OUTPUT):
+        log(f"WARN: could not switch output to {SILENT_OUTPUT!r}; capture will be audible")
+        return False
+    try:
+        SILENCED_FROM_FILE.write_text(prior)
+    except OSError as e:
+        log(f"begin_silence: couldn't persist prior output: {e}")
+    log(f"routing output to {SILENT_OUTPUT!r} for Spotify capture (was {prior!r})")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Spotify playback settings that silently corrupt a capture.
+#
+# Found 2026-09-21 while reading how the commercial converters handle this.
+# Every vendor in the Sidify/NoteBurner/Macsome family publishes the same FAQ
+# entry -- "converted songs are quieter than the original? uncheck 'Set the
+# same volume level for all songs'" -- because Spotify applies loudness
+# normalisation *inside the app*, upstream of any per-app tap. It bakes into
+# the file and there is no way to tell after the fact.
+#
+# Crossfade and Automix are worse: they overlap adjacent tracks at the output
+# layer, so the next song is already playing under the current one. No
+# boundary logic downstream can recover a clean edge from that.
+#
+# These live in Spotify's per-user prefs file, which is plain key=value.
+# ---------------------------------------------------------------------------
+
+SPOTIFY_PREFS_GLOB = "Library/Application Support/Spotify/Users/*/prefs"
+
+# key -> (bad when equal to this, what it does to the capture)
+SPOTIFY_BAD_PREFS = {
+    "audio.normalize_v2": ("true", "loudness normalisation is baked into every capture"),
+    "audio.normalize": ("true", "loudness normalisation is baked into every capture"),
+    "audio.automix": ("true", "Automix overlaps track boundaries"),
+    "audio.crossfade_v2": ("true", "crossfade bleeds the next song under this one"),
+}
+
+
+def spotify_prefs():
+    """Parse Spotify's per-user prefs into a dict. Empty dict if unreadable."""
+    out = {}
+    for path in sorted(HOME.glob(SPOTIFY_PREFS_GLOB)):
+        try:
+            for line in path.read_text(errors="ignore").splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    out[k.strip()] = v.strip()
+        except OSError:
+            continue
+    return out
+
+
+def check_spotify_playback_prefs():
+    """Warn (log + notify) when a Spotify setting would corrupt the capture.
+
+    Read-only on purpose: these are the user's playback preferences and
+    silently rewriting them would change how his own listening sounds. Say
+    what is wrong and let him decide."""
+    prefs = spotify_prefs()
+    if not prefs:
+        return []
+    problems = []
+    for key, (bad, why) in SPOTIFY_BAD_PREFS.items():
+        if prefs.get(key, "").lower() == bad:
+            problems.append((key, why))
+    # Streaming quality: the tap records whatever Spotify decodes, so a
+    # non-top quality setting silently caps every capture. Desktop enum runs
+    # 1=Low / 2=Normal / 3=High / 4=Very High (320 kbps).
+    q = prefs.get("audio.play_bitrate_enumeration", "")
+    if q.isdigit() and int(q) < 4:
+        problems.append(("audio.play_bitrate_enumeration",
+                         f"streaming quality is not Very High (enum {q}) -- "
+                         "every capture is capped below 320 kbps"))
+    if prefs.get("audio.allow_downgrade", "").lower() == "true":
+        problems.append(("audio.allow_downgrade",
+                         "Spotify may drop quality on a weak connection mid-capture"))
+
+    # crossfade_time > 0 means crossfade is on even without the bool
+    try:
+        if int(prefs.get("audio.crossfade_time", "0") or 0) > 0:
+            problems.append(("audio.crossfade_time",
+                             "crossfade bleeds the next song under this one"))
+    except ValueError:
+        pass
+    if problems:
+        lines = "\n".join(f"  {k} -> {why}" for k, why in problems)
+        log(f"WARN: Spotify playback settings will affect this capture:\n{lines}")
+        send_imsg("\u26a0\ufe0f Spotify settings that hurt the capture:\n"
+                  + "\n".join(f"- {why}" for _, why in problems)
+                  + "\nTurn them off in Spotify > Settings > Playback.")
+    else:
+        log("spotify prefs ok: no normalisation, crossfade or automix")
+    return problems
+
+
+def begin_spotify_volume():
+    """Remember Spotify's own volume, then pin it to 100 for the session.
+
+    With a per-app tap (ScreenCaptureKit) the app's volume slider IS the
+    recorded level -- leave it at 50 and every file is ~6 dB quiet forever,
+    with no way to tell after the fact. So we force 100 and put his setting
+    back afterwards. Persisted to disk so a SIGTERM'd capture still restores.
+    """
+    if not spotify_running():
+        return
+    try:
+        cur = osa('tell application "Spotify" to get sound volume') or ""
+        cur = int(float(cur))
+    except (TypeError, ValueError):
+        return
+    if not SPOTIFY_VOL_FILE.exists():
+        try:
+            SPOTIFY_VOL_FILE.write_text(str(cur))
+        except OSError as e:
+            log(f"begin_spotify_volume: couldn't persist {cur}: {e}")
+    if cur != 100:
+        log(f"pinning Spotify volume 100 for the capture (was {cur})")
+    spotify_set_volume(100)
+
+
+def end_spotify_volume():
+    """Put Spotify's volume back where the user had it. Idempotent."""
+    if not SPOTIFY_VOL_FILE.exists():
+        return
+    try:
+        prior = int(SPOTIFY_VOL_FILE.read_text().strip())
+    except (OSError, ValueError):
+        prior = None
+    if prior is not None and spotify_running():
+        if prior >= 99:
+            # Already at (or effectively at) max -- skip the write. Spotify
+            # quantises `set sound volume`, so a 54 round-trips as 53; not
+            # re-setting a 100 keeps the common case drift-free.
+            log("Spotify volume was already max, nothing to restore")
+        else:
+            spotify_set_volume(max(0, min(100, prior)))
+            log(f"restored Spotify volume to {prior}")
+    SPOTIFY_VOL_FILE.unlink(missing_ok=True)
+
+
+def end_spotify_silence():
+    """Restore the output device saved by begin_spotify_silence, if any.
+    Safe to call unconditionally and idempotent — no-op when no silence is
+    pending. Also invoked from cmd_stop so an interrupted capture still flips
+    the speakers back."""
+    if not SILENCED_FROM_FILE.exists():
+        return
+    try:
+        prior = SILENCED_FROM_FILE.read_text().strip()
+    except OSError:
+        prior = ""
+    if prior and prior in sw_outputs():
+        sw_set_output(prior)
+        log(f"restored default output to {prior!r}")
+    elif prior:
+        # Device was unplugged mid-capture. Leaving the default on BlackHole
+        # would hand back a Mac with no audible output at all, so pick the
+        # best remaining real device instead of doing nothing.
+        fb = fallback_output()
+        log(f"prior output {prior!r} unavailable -> {fb!r}")
+        if fb:
+            sw_set_output(fb)
+    SILENCED_FROM_FILE.unlink(missing_ok=True)
+
+
+def end_spotify_playback(require_session=False):
+    """Pause Spotify at the end of a capture session.
+
+    Every capture path drives Spotify's transport, so when the session ends the
+    app must not be left playing — it auto-advances into the next track and,
+    once end_spotify_silence() flips the default output back off BlackHole,
+    that lands audibly on the speakers.
+
+    MUST be called BEFORE end_spotify_volume()/end_spotify_silence() so the
+    pause happens while the output is still routed to BlackHole (no burst).
+
+    Idempotent and safe to call unconditionally: no-op when Spotify isn't
+    running or is already paused/stopped.
+
+    2026-09-21: added after Gurinder found Spotify playing on its own. The
+    hole was the skip path — capture_spotify_track() returns early on a
+    duration-verified existing file, BEFORE the pre-flight spotify_pause(),
+    so a re-fire of an already-captured track started playback and nothing
+    ever stopped it. Same for cmd_stop() on a killed capture.
+    """
+    try:
+        # require_session: only act if begin_spotify_silence() ran this session
+        # (cmd_stop can fire on a raw non-Spotify capture while Gurinder is
+        # listening to Spotify himself — don't stop his music).
+        if require_session and not SILENCED_FROM_FILE.exists():
+            return
+        if not spotify_running():
+            return
+        # Pause unconditionally rather than gating on player state: the
+        # AppleScript state read lags the transport by a beat, so a stale
+        # "paused" would skip a pause that is actually needed. Pausing an
+        # already-paused Spotify is a no-op. State is read only for the log.
+        was_playing = spotify_state() == "playing"
+        spotify_pause()
+        if was_playing:
+            log("paused Spotify at end of capture session")
+    except Exception as e:
+        log(f"end_spotify_playback failed: {e}")
+
+
+def fallback_output():
+    """Pick a real output device when the saved one is gone or stale.
+
+    Portable replacement for the old hardcoded interface/speaker pair:
+    never name a device, just take the last known-good one if it is
+    still attached, else the first attached output that isn't one of ours
+    (the Multi-Output aggregate or the silent BlackHole device)."""
+    ours = {MULTIOUT_NAME, SILENT_OUTPUT}
+    outs = sw_outputs()
+    prev = (load_state() or {}).get("start_default_output")
+    if prev and prev in outs and prev not in ours:
+        return prev
+    for o in outs:
+        if o not in ours:
+            return o
+    return outs[0] if outs else ""
+
+
+def save_state(d):
+    STATEFILE.write_text(json.dumps(d, indent=2))
+
+
+def load_state():
+    if not STATEFILE.exists():
+        return None
+    try:
+        return json.loads(STATEFILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def clear_state():
+    STATEFILE.unlink(missing_ok=True)
+
+
+def enter_capture_mode(silent=False):
+    # Force BlackHole to 44.1 kHz so it matches whatever the audible side
+    # is using. (We use AVAudioEngine to capture so this is mostly belt-
+    # and-braces; the multi-output config also handles drift.)
+    rate_bin = CFG.ensure_rate
+    if rate_bin and Path(rate_bin).exists():
+        try:
+            subprocess.run([str(rate_bin)], capture_output=True, timeout=5)
+        except Exception as e:
+            log(f"ensure-blackhole-rate fail: {e}")
+
+    saved = {
+        "start_default_output": sw_current_output(),
+        "start_muted": system_muted(),
+    }
+    if spotify_running():
+        try:
+            saved["start_spotify_volume"] = int(osa('tell application "Spotify" to get sound volume') or "100")
+        except ValueError:
+            saved["start_spotify_volume"] = 100
+
+    # Build the Multi-Output dynamically: only the user's CURRENT default
+    # output goes in (plus BlackHole). This avoids audio leaking into other
+    # speakers — e.g. on an audio interface, the built-in outputs stay silent.
+    audible = saved["start_default_output"]
+    if audible == MULTIOUT_NAME:
+        # Stale state: previous capture didn't restore. Pick the saved
+        # pre-capture device, else a sensible fallback.
+        audible = fallback_output()
+        log(f"current default is already {MULTIOUT_NAME!r} (stale), using {audible!r} as audible")
+    saved["audible_in_multiout"] = audible
+
+    multiout_bin = CFG.multiout
+    if multiout_bin and Path(multiout_bin).exists():
+        try:
+            # The helper used to hardcode the device name, so a rename meant
+            # patching a binary. It now takes both from the environment, which
+            # makes the config file the single source of truth — if these
+            # disagree, the switch below looks for a device that doesn't exist.
+            menv = dict(os.environ)
+            menv["AD_MULTIOUT_NAME"] = MULTIOUT_NAME
+            menv["AD_LOOPBACK_DEVICE"] = SILENT_OUTPUT
+            r = subprocess.run([str(multiout_bin), audible], capture_output=True,
+                               text=True, timeout=8, env=menv)
+            if r.returncode != 0:
+                log(f"ad-multiout failed rc={r.returncode}: {r.stderr.strip()}")
+        except Exception as e:
+            log(f"ad-multiout error: {e}")
+    else:
+        log(f"WARN: {multiout_bin} missing — using existing Multi-Output as-is")
+
+    if not sw_set_output(MULTIOUT_NAME):
+        log(f"WARN: switch to {MULTIOUT_NAME} failed")
+    if silent:
+        set_muted(True)
+    save_state(saved)
+    log(f"entered capture mode, audible={audible!r}, prior={saved}")
+    return saved
+
+
+def exit_capture_mode():
+    saved = load_state()
+    if not saved:
+        log("exit_capture_mode: no saved state")
+        return
+    target = saved.get("start_default_output") or ""
+    outputs = sw_outputs()
+    if target and target in outputs:
+        sw_set_output(target)
+    else:
+        fb = fallback_output()
+        log(f"start-time output {target!r} unavailable -> {fb!r}")
+        if fb:
+            sw_set_output(fb)
+    set_muted(bool(saved.get("start_muted", False)))
+    if "start_spotify_volume" in saved and spotify_running():
+        osa(f'tell application "Spotify" to set sound volume to {saved["start_spotify_volume"]}')
+    clear_state()
+    log("exited capture mode")
+
+
+def pid_running(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_pidlock():
+    if PIDFILE.exists():
+        try:
+            old = int(PIDFILE.read_text().strip())
+            if pid_running(old):
+                return False
+        except (ValueError, OSError):
+            pass
+    PIDFILE.write_text(str(os.getpid()))
+    return True
+
+
+def release_pidlock():
+    PIDFILE.unlink(missing_ok=True)
+
+
+def current_pid():
+    if not PIDFILE.exists():
+        return None
+    try:
+        pid = int(PIDFILE.read_text().strip())
+        return pid if pid_running(pid) else None
+    except (ValueError, OSError):
+        return None
+
+
+def queue_load():
+    if not QUEUEFILE.exists():
+        return []
+    try:
+        return json.loads(QUEUEFILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def queue_save(items):
+    QUEUEFILE.write_text(json.dumps(items, indent=2))
+
+
+def queue_append(item):
+    items = queue_load()
+    items.append(item)
+    queue_save(items)
+    return len(items)
+
+
+def queue_pop():
+    items = queue_load()
+    if not items:
+        return None
+    head = items.pop(0)
+    queue_save(items)
+    return head
+
+
+def queue_clear():
+    QUEUEFILE.unlink(missing_ok=True)
+
+
+def blackhole_avf_index():
+    r = subprocess.run(
+        [FFMPEG, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+        capture_output=True, text=True,
+    )
+    blob = r.stdout + r.stderr
+    cut = blob.find("AVFoundation audio devices")
+    if cut < 0:
+        raise RuntimeError("BlackHole not found in ffmpeg device list")
+    m = re.search(r"\[(\d+)\] BlackHole 2ch", blob[cut:])
+    if not m:
+        raise RuntimeError("BlackHole 2ch not in ffmpeg audio devices")
+    return int(m.group(1))
+
+
+AVREC = CFG.avrec
+AVREC_APP = CFG.avrec_app
+# pgrep pattern for "any avrec process". str(AVREC) prefix-matches avrec-app
+# too when the two live in the same directory, which is the normal install.
+AVREC_PGREP = str(AVREC)
+SPOTIFY_BUNDLE_ID = "com.spotify.client"
+
+
+def avrec_capture_bg(out_caf):
+    """Start indefinite Swift AVAudioEngine recorder reading from BlackHole.
+    Returns Popen. Stop with SIGTERM; tap drains and the .caf flushes cleanly.
+    Used by raw `!rec` system-audio captures."""
+    cmd = [str(AVREC), SILENT_OUTPUT, str(out_caf)]
+    log(f"avrec bg: {' '.join(shlex.quote(c) for c in cmd)}")
+    return subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# launchd-attributed spawn for the ScreenCaptureKit helper
+#
+# Screen Recording (TCC) is keyed to the *responsible process* of whatever
+# opens the SCK stream. When record-audio is launched from a claude session
+# that resolves to the claude binary — whose absolute path changes on every
+# auto-update, so the grant silently drops and avrec-app dies with
+# "ScreenCaptureKit permission denied". `claude-tcc-migrate` cannot repair it:
+# Screen Recording lives in the SIP-protected *system* TCC.db, which is not
+# writable without root. Bit us 2026-05-18, 06-22, 08-12 and twice on 08-25.
+#
+# Fix at the source: bootstrap avrec-app as its own launchd job. launchd
+# becomes the responsible process and the grant keys to ~/.claude/bin/avrec-app,
+# a path that never changes. Captures then stop caring about claude updates.
+#
+# TRAP (measured 2026-08-25): `launchctl submit` is NOT usable here. It creates
+# the job with OnDemand=false (i.e. KeepAlive), so launchd respawns avrec-app
+# the instant avrec_stop() SIGTERMs it — and the respawn truncates the .caf we
+# just finished. Verified: `launchctl submit -- /bin/sleep 6` came back with a
+# new PID after exit. A bootstrapped plist with RunAtLoad and NO KeepAlive is
+# run-once, which is what we need. Do not "simplify" this back to submit.
+# ---------------------------------------------------------------------------
+
+LAUNCHD_DIR = STATE_DIR / "rec-launchd"
+LAUNCHD_PREFIX = CFG.launchd_prefix
+USE_LAUNCHD_AVREC = os.environ.get("REC_NO_LAUNCHD", "") != "1"
+
+
+def _xml_esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _decode_wait_status(status):
+    """launchd reports LastExitStatus as a raw wait(2) status, not an exit code
+    (e.g. 512 for `exit 2`). Normalise to Popen's convention so log lines and
+    callers see the same numbers they would from a direct subprocess."""
+    if status is None:
+        return None
+    if status > 255:
+        sig = status & 0x7F
+        return -sig if sig else (status >> 8)
+    return status
+
+
+class LaunchdProc:
+    """Popen-compatible handle for a process running as its own launchd job.
+
+    Implements only the surface record-audio actually uses: .pid, .returncode,
+    .poll(), .wait(timeout=), .terminate(), .kill(). Signals go straight to the
+    real pid (launchd won't respawn — no KeepAlive), and the job is booted out
+    and its plist unlinked once the process is gone."""
+
+    GRACE = 5.0  # let launchd spawn before poll() believes an absent PID
+
+    def __init__(self, label, plist_path, domain):
+        self.label = label
+        self.plist_path = pathlib_Path(plist_path)
+        self.domain = domain
+        self.pid = None
+        self.returncode = None
+        self._t0 = time.time()
+        self._seen_pid = False
+        self._torn_down = False
+
+    def _list(self):
+        r = subprocess.run(["launchctl", "list", self.label],
+                           capture_output=True, text=True)
+        return r.stdout if r.returncode == 0 else None
+
+    def _refresh(self):
+        """-> (pid_or_None, last_exit_or_None, job_exists)"""
+        blob = self._list()
+        if blob is None:
+            return None, None, False
+        m = re.search(r'"PID"\s*=\s*(\d+)', blob)
+        pid = int(m.group(1)) if m else None
+        m = re.search(r'"LastExitStatus"\s*=\s*(-?\d+)', blob)
+        rc = int(m.group(1)) if m else None
+        return pid, rc, True
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        pid, rc, exists = self._refresh()
+        if pid:
+            self.pid = pid
+            self._seen_pid = True
+            return None
+        # No PID: either launchd hasn't spawned it yet, or it has exited.
+        if not self._seen_pid and exists and (time.time() - self._t0) < self.GRACE:
+            return None
+        self.returncode = (_decode_wait_status(rc) if rc is not None
+                           else (0 if self._seen_pid else 1))
+        self._teardown()
+        return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            rc = self.poll()
+            if rc is not None:
+                return rc
+            if deadline is not None and time.time() >= deadline:
+                raise subprocess.TimeoutExpired(self.label, timeout)
+            time.sleep(0.05)
+
+    def _signal(self, sig):
+        if self.pid:
+            try:
+                os.kill(self.pid, sig)
+                return
+            except (ProcessLookupError, PermissionError):
+                pass
+        self._teardown()
+
+    def terminate(self):
+        self._signal(signal.SIGTERM)
+
+    def kill(self):
+        self._signal(signal.SIGKILL)
+
+    def _teardown(self):
+        if self._torn_down:
+            return
+        self._torn_down = True
+        subprocess.run(["launchctl", "bootout", f"{self.domain}/{self.label}"],
+                       capture_output=True)
+        try:
+            self.plist_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def launchd_spawn(cmd, stderr_path=None, tag="job", wait_pid=3.0):
+    """Bootstrap `cmd` as a run-once launchd job. Returns LaunchdProc or None.
+
+    None means the job could not be created at all — caller should fall back to
+    a direct subprocess. A job that started and then died fast still returns a
+    LaunchdProc, so the caller's normal early-fail path reports the real error
+    instead of silently retrying under the wrong attribution."""
+    try:
+        LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log(f"launchd spawn: cannot mkdir {LAUNCHD_DIR}: {e}")
+        return None
+    uid = os.getuid()
+    domain = f"gui/{uid}"
+    label = f"{LAUNCHD_PREFIX}.rec-{tag}-{os.getpid()}-{int(time.time() * 1000) % 10**9}"
+    plist_path = LAUNCHD_DIR / f"{label}.plist"
+    err_path = str(stderr_path) if stderr_path else "/dev/null"
+    args_xml = "".join(f"    <string>{_xml_esc(a)}</string>\n" for a in cmd)
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0"><dict>\n'
+        f'  <key>Label</key><string>{_xml_esc(label)}</string>\n'
+        f'  <key>ProgramArguments</key><array>\n{args_xml}  </array>\n'
+        '  <key>RunAtLoad</key><true/>\n'
+        '  <key>ProcessType</key><string>Interactive</string>\n'
+        '  <key>StandardOutPath</key><string>/dev/null</string>\n'
+        f'  <key>StandardErrorPath</key><string>{_xml_esc(err_path)}</string>\n'
+        '</dict></plist>\n'
+    )
+    try:
+        plist_path.write_text(plist)
+    except Exception as e:
+        log(f"launchd spawn: cannot write plist: {e}")
+        return None
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+    r = subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"launchd spawn: bootstrap rc={r.returncode} err={r.stderr.strip()!r}")
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+        plist_path.unlink(missing_ok=True)
+        return None
+    p = LaunchdProc(label, plist_path, domain)
+    deadline = time.time() + wait_pid
+    while time.time() < deadline:
+        pid, _rc, exists = p._refresh()
+        if pid:
+            p.pid = pid
+            p._seen_pid = True
+            break
+        if not exists:
+            log(f"launchd spawn: {label} vanished before it ran")
+            plist_path.unlink(missing_ok=True)
+            return None
+        time.sleep(0.05)
+    if not p._seen_pid:
+        log(f"launchd spawn: {label} bootstrapped but no pid within {wait_pid}s "
+            "(job still loaded; poll() will report its exit)")
+    return p
+
+
+def avrec_app_capture_bg(out_caf, bundle_id=SPOTIFY_BUNDLE_ID, stderr_path=None):
+    """Start ScreenCaptureKit per-app audio recorder. Returns a Popen-like handle.
+    Captures audio from a single app (default Spotify) without touching the
+    system default output — no BlackHole, no Multi-Output, no mute. Other
+    apps continue playing through the user's normal output, and their audio
+    does NOT bleed into the capture.
+
+    The recorder is bootstrapped as its own run-once launchd job so the Screen
+    Recording TCC grant resolves against ~/.claude/bin/avrec-app (stable path)
+    rather than the calling claude binary (path changes every auto-update).
+    See the LaunchdProc block above. Set REC_NO_LAUNCHD=1 to force the old
+    direct-subprocess behaviour; it is also the automatic fallback if the job
+    cannot be created.
+
+    If stderr_path is given, avrec-app's stderr is captured to that file so
+    failures (TCC denial, bundle id wrong, etc) are diagnosable. Otherwise
+    stderr is discarded as before."""
+    cmd = [str(AVREC_APP), bundle_id, str(out_caf)]
+    if USE_LAUNCHD_AVREC:
+        p = launchd_spawn(cmd, stderr_path=stderr_path, tag="avrec")
+        if p is not None:
+            log(f"avrec-app launchd: {p.label} pid={p.pid} -> {out_caf}")
+            return p
+        log("avrec-app: launchd spawn unavailable, falling back to direct subprocess")
+    log(f"avrec-app bg: {' '.join(shlex.quote(c) for c in cmd)}")
+    stderr_target = subprocess.DEVNULL
+    if stderr_path is not None:
+        try:
+            stderr_target = open(stderr_path, "w")
+        except Exception:
+            stderr_target = subprocess.DEVNULL
+    return subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=stderr_target,
+        start_new_session=True,
+    )
+
+
+def avrec_stop(p, timeout=5.0):
+    """Send SIGTERM, wait for clean exit (file flush). Works for both avrec
+    and avrec-app helpers (both honor SIGTERM with a clean shutdown)."""
+    try:
+        p.terminate()
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log("avrec didn't quit on SIGTERM, SIGKILL")
+        p.kill()
+        p.wait()
+
+
+def encode_caf_to_mp3(caf_segments, out_mp3):
+    """Concat CAF segments into one MP3 (320 CBR, 44.1k stereo).
+    Encoding is post-process so no real-time drift here."""
+    if not caf_segments:
+        return False
+    listfile = SEG_DIR / f"concat-{int(time.time())}.txt"
+    listfile.write_text("".join(f"file {shlex.quote(str(s))}\n" for s in caf_segments))
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y",
+           "-f", "concat", "-safe", "0", "-i", str(listfile),
+           "-ac", "2", "-ar", "44100",
+           "-c:a", "libmp3lame", "-b:a", "320k",
+           str(out_mp3)]
+    r = subprocess.run(cmd, capture_output=True)
+    listfile.unlink(missing_ok=True)
+    if r.returncode != 0:
+        log(f"encode rc={r.returncode}: {r.stderr.decode(errors='ignore')}")
+        return False
+    return True
+
+
+def spotify_launch():
+    if spotify_running():
+        return True
+    osa('tell application "Spotify" to launch')
+    for _ in range(20):
+        time.sleep(0.5)
+        if spotify_running():
+            time.sleep(1.0)
+            return True
+    return False
+
+
+_SPOTIFY_RE = re.compile(
+    r"(?:open\.spotify\.com/(?P<k1>track|album|playlist)/(?P<i1>[A-Za-z0-9]+))"
+    r"|(?:spotify:(?P<k2>track|album|playlist):(?P<i2>[A-Za-z0-9]+))"
+)
+
+
+_SPOTIFY_SHORT_RE = re.compile(r"open\.spotify\.com/s/([A-Za-z0-9]+)")
+
+
+def spotify_resolve_short(s):
+    """Spotify's mobile share sheet emits open.spotify.com/s/<code> links that
+    carry no track/album/playlist kind, so _SPOTIFY_RE misses them entirely and
+    the capture silently falls through to yt-dlp. Follow the redirect to the
+    canonical URL. Needs a browser UA — a bare urllib UA gets no redirect."""
+    m = _SPOTIFY_SHORT_RE.search(s or "")
+    if not m:
+        return None
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"https://open.spotify.com/s/{m.group(1)}",
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/120.0 Safari/537.36"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            url = r.geturl()
+        log(f"spotify short-link {m.group(1)} -> {url}")
+        return url
+    except Exception as e:
+        log(f"spotify short-link resolve failed: {type(e).__name__}: {e}")
+        return None
+
+
+def spotify_normalize(s):
+    m = _SPOTIFY_RE.search(s.strip())
+    if not m:
+        expanded = spotify_resolve_short(s)
+        if expanded:
+            m = _SPOTIFY_RE.search(expanded)
+    if not m:
+        return None
+    kind = m.group("k1") or m.group("k2")
+    sid = m.group("i1") or m.group("i2")
+    return (kind, f"spotify:{kind}:{sid}")
+
+
+def spotify_play(uri, context=None):
+    # `in context "..."` is essential when Spotify has a sticky autoplay queue —
+    # without it, `play track URI` is silently overridden and Spotify reverts
+    # to whatever was playing before. The context arg should be a playlist or
+    # album URI; for plain playlist/album plays the URI itself is passed and
+    # `in context` is omitted.
+    if context and context != uri:
+        script = f'tell application "Spotify" to play track "{uri}" in context "{context}"'
+    else:
+        script = f'tell application "Spotify" to play track "{uri}"'
+    osa(script, timeout=15)
+
+
+def spotify_track_album(uri):
+    """Resolve a track's album URI by scraping its open.spotify.com page.
+    Some tracks refuse a bare `play track` entirely (client keeps the old
+    track, seen 2026-06-10 with Sohni Kuri) but play fine in album context."""
+    m = re.match(r"spotify:track:([A-Za-z0-9]{22})", uri or "")
+    if not m:
+        return None
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"https://open.spotify.com/track/{m.group(1)}",
+            headers={"User-Agent": "Mozilla/5.0"})
+        html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "replace")
+    except Exception as e:
+        log(f"spotify_track_album fetch failed: {e}")
+        return None
+    am = re.search(r"album/([A-Za-z0-9]{22})", html)
+    return f"spotify:album:{am.group(1)}" if am else None
+
+
+def spotify_play_verified(uri, context=None, retries=2, settle=1.5):
+    """Play `uri` and verify Spotify actually navigated there. Retries on
+    queue-override; after the first miss without a context, falls back to
+    playing inside the track's album context."""
+    ctx = context
+    for attempt in range(retries + 1):
+        spotify_play(uri, context=ctx)
+        time.sleep(settle)
+        cur = osa('tell application "Spotify" to id of current track') or ""
+        if cur == uri:
+            return True
+        log(f"spotify_play mismatch attempt {attempt+1}: got {cur}, want {uri}")
+        spotify_pause()
+        time.sleep(0.3)
+        if ctx is None:
+            ctx = spotify_track_album(uri)
+            if ctx:
+                log(f"spotify_play retrying in album context {ctx}")
+    return False
+
+
+def spotify_pause():
+    osa('tell application "Spotify" to pause')
+
+
+def spotify_next():
+    osa('tell application "Spotify" to next track')
+
+
+def spotify_state():
+    # MUST be "as string" — via the spotify-ctl bridge, bare `player state`
+    # returns the raw AppleScript enum (kPSP/kPSp/kPSS) instead of the
+    # coerced "playing"/"paused"/"stopped" that plain osascript yielded.
+    # Without this every `st == "playing"` check silently fails.
+    return osa('tell application "Spotify" to player state as string')
+
+
+def spotify_position():
+    s = osa('tell application "Spotify" to player position')
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def spotify_set_volume(v):
+    osa(f"tell application \"Spotify\" to set sound volume to {v}")
+
+
+def spotify_set_position(pos):
+    osa(f'tell application "Spotify" to set player position to {pos}')
+
+
+def spotify_current_track():
+    script = '''
+    tell application "Spotify"
+        set t to current track
+        set _name to name of t
+        set _artist to artist of t
+        set _album to album of t
+        try
+            set _albumartist to album artist of t
+        on error
+            set _albumartist to ""
+        end try
+        set _dur to duration of t
+        try
+            set _tnum to track number of t
+        on error
+            set _tnum to 0
+        end try
+        try
+            set _dnum to disc number of t
+        on error
+            set _dnum to 0
+        end try
+        set _id to id of t
+        try
+            set _spurl to spotify url of t
+        on error
+            set _spurl to ""
+        end try
+        try
+            set _art to artwork url of t
+        on error
+            set _art to ""
+        end try
+        return _name & "|||" & _artist & "|||" & _album & "|||" & _albumartist & "|||" & _dur & "|||" & _tnum & "|||" & _dnum & "|||" & _id & "|||" & _spurl & "|||" & _art
+    end tell
+    '''
+    out = osa(script, timeout=10)
+    parts = out.split("|||")
+    if len(parts) < 10:
+        log(f"current_track parse fail: {out!r}")
+        return {}
+    name, artist, album, albumartist, dur, tnum, dnum, sid, spurl, art = parts[:10]
+    try:
+        dur_ms = int(float(dur))
+    except ValueError:
+        dur_ms = 0
+    try:
+        tnum_i = int(tnum or 0)
+    except ValueError:
+        tnum_i = 0
+    try:
+        dnum_i = int(dnum or 0)
+    except ValueError:
+        dnum_i = 0
+    return {
+        "name": name, "artist": artist, "album": album,
+        "album_artist": albumartist or artist,
+        "duration_ms": dur_ms,
+        "track_number": tnum_i,
+        "disc_number": dnum_i,
+        "id": sid, "spotify_url": spurl, "artwork_url": art,
+    }
+
+
+def write_id3(mp3_path, meta, art_bytes=None):
+    try:
+        from mutagen.id3 import (
+            ID3, ID3NoHeaderError, TIT2, TPE1, TALB, TPE2, TRCK, TPOS,
+            TYER, APIC,
+        )
+    except ImportError:
+        log("mutagen not importable — skipping ID3")
+        return
+    try:
+        tags = ID3(mp3_path)
+    except ID3NoHeaderError:
+        tags = ID3()
+    if meta.get("name"):
+        tags["TIT2"] = TIT2(encoding=3, text=meta["name"])
+    if meta.get("artist"):
+        tags["TPE1"] = TPE1(encoding=3, text=meta["artist"])
+    if meta.get("album"):
+        tags["TALB"] = TALB(encoding=3, text=meta["album"])
+    if meta.get("album_artist"):
+        tags["TPE2"] = TPE2(encoding=3, text=meta["album_artist"])
+    if meta.get("track_number"):
+        tags["TRCK"] = TRCK(encoding=3, text=str(meta["track_number"]))
+    if meta.get("disc_number"):
+        tags["TPOS"] = TPOS(encoding=3, text=str(meta["disc_number"]))
+    if meta.get("year"):
+        tags["TYER"] = TYER(encoding=3, text=str(meta["year"]))
+    if art_bytes:
+        tags["APIC"] = APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=art_bytes)
+    tags.save(mp3_path, v2_version=3)
+
+
+def fetch_artwork(url):
+    if not url:
+        return None
+    try:
+        import requests
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200 and r.content:
+            return r.content
+    except Exception as e:
+        log(f"artwork fetch fail: {e}")
+    return None
+
+
+SILENCE_FLOOR_DB = -45.0
+
+
+def audio_has_signal(path, floor_db=SILENCE_FLOOR_DB):
+    """True if the file carries real audio. Samples 60s starting at 20s and
+    reads ffmpeg's volumedetect mean_volume. A silent capture reports -91 dB
+    (or -inf); real music sits around -10 to -20 dB. On any failure we return
+    True (fail-open) so this never blocks a legitimate skip."""
+    try:
+        r = subprocess.run(
+            [FFMPEG, "-hide_banner", "-nostats",
+             "-ss", "20", "-t", "60", "-i", str(path),
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60)
+        for line in (r.stderr or "").splitlines():
+            if "mean_volume:" in line:
+                val = line.split("mean_volume:")[1].strip().split()[0]
+                if val.lstrip("-").lower().startswith("inf"):
+                    return False
+                return float(val) > floor_db
+        return True
+    except Exception as e:
+        log(f"skip-guard: volumedetect failed for {path.name} ({e}) — assuming ok")
+        return True
+
+
+def probe_duration(path):
+    """Real duration of a file in seconds via ffprobe. 0.0 on any failure."""
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-show_entries",
+             "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+             str(path)],
+            capture_output=True, text=True, timeout=15)
+        return float((r.stdout or "").strip() or 0.0)
+    except Exception as e:
+        log(f"probe duration failed for {path.name} ({e})")
+        return 0.0
+
+
+# Only trim when the file actually overshoots by more than this, so a capture
+# that ended short (pause, dead tail) is never touched.
+TRIM_SLACK_S = 0.30
+
+
+def trim_to_stated_duration(path, duration_s):
+    """Trim a finished capture back to Spotify's stated dur=, losslessly.
+
+    WRAP_TAIL_EXTEND is deliberate *during* recording — it catches the song's
+    true end — but it must never survive into the file: on a track with a long
+    fade the fade completes before the position wrap, so the extension records
+    the opening of the NEXT song at full level (defect class 4 in
+    reference_rec_capture_defects.md). `-t <dur> -c copy` cuts on frame
+    boundaries, so this is a re-mux with no re-encode, and -map 0 /
+    -map_metadata 0 carry the ID3 tags and cover art through. The trimmed file
+    replaces the original with os.replace() — same directory, so the swap is
+    atomic and a failed trim can never leave a truncated file behind.
+
+    Returns True if the file was trimmed."""
+    if not path or not path.exists() or duration_s <= 0:
+        return False
+    actual = probe_duration(path)
+    if actual <= 0:
+        log(f"tail-trim: cannot probe {path.name} — leaving untrimmed")
+        return False
+    if actual <= duration_s + TRIM_SLACK_S:
+        log(f"tail-trim: {path.name} is {actual:.2f}s vs stated "
+            f"{duration_s:.2f}s — nothing to trim")
+        return False
+    tmp = path.with_name(f"{path.name}.trim-{os.getpid()}.mp3")
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y",
+           "-i", str(path), "-t", f"{duration_s:.3f}",
+           "-map", "0", "-c", "copy",
+           "-map_metadata", "0", "-id3v2_version", "3",
+           str(tmp)]
+    r = subprocess.run(cmd, capture_output=True)
+    new_dur = probe_duration(tmp) if tmp.exists() else 0.0
+    if r.returncode != 0 or new_dur < duration_s - 1.0:
+        log(f"tail-trim: FAILED rc={r.returncode} for {path.name} "
+            f"(got {new_dur:.2f}s, wanted {duration_s:.2f}s) — keeping "
+            f"original: {r.stderr.decode(errors='ignore')[-200:].strip()}")
+        tmp.unlink(missing_ok=True)
+        return False
+    os.replace(tmp, path)
+    log(f"tail-trim: {path.name} {actual:.2f}s -> {new_dur:.2f}s "
+        f"(stated dur {duration_s:.2f}s, lossless copy)")
+    return True
+
+
+# A real fade decays into the last seconds; it does not jump. A step up this
+# big at the very end is the signature of the next track starting in-file.
+TAIL_BLEED_DB = 8.0
+
+
+def segment_mean_db(path, start_s, length_s):
+    """volumedetect mean_volume over one window, in dBFS. None if unreadable.
+
+    NOTE: volumedetect (like silencedetect) prints at ffmpeg INFO level —
+    `-v error` suppresses it silently and every reading comes back empty. That
+    false negative is documented in reference_rec_capture_defects.md. Always
+    -v info here."""
+    try:
+        r = subprocess.run(
+            [FFMPEG, "-hide_banner", "-nostats", "-v", "info",
+             "-ss", f"{max(0.0, start_s):.3f}", "-t", f"{length_s:.3f}",
+             "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60)
+        for line in (r.stderr or "").splitlines():
+            if "mean_volume:" in line:
+                val = line.split("mean_volume:")[1].strip().split()[0]
+                if val.lstrip("-").lower().startswith("inf"):
+                    return -99.0
+                return float(val)
+        return None
+    except Exception as e:
+        log(f"tail-check: volumedetect failed for {path.name} ({e})")
+        return None
+
+
+def check_tail_bleed(path, threshold_db=TAIL_BLEED_DB):
+    """Post-capture tail check. Warns to the log if the final 2s sit more than
+    `threshold_db` above the 3s preceding them — the tail-bleed signature from
+    rec-audit's class 4. Never mutates the file; this reports only."""
+    dur = probe_duration(path)
+    if dur < 6.0:
+        return None
+    pre = segment_mean_db(path, dur - 5.0, 3.0)
+    tail = segment_mean_db(path, dur - 2.0, 2.0)
+    if pre is None or tail is None:
+        log(f"tail-check: no level reading for {path.name} — skipped")
+        return None
+    delta = tail - pre
+    if delta > threshold_db:
+        log(f"tail-check WARNING: {path.name} tail bleed +{delta:.1f}dB "
+            f"(last 2s {tail:.1f}dB vs preceding 3s {pre:.1f}dB, threshold "
+            f"+{threshold_db:.1f}dB) — next-track bleed likely, verify by ear")
+    else:
+        log(f"tail-check: {path.name} tail ok ({delta:+.1f}dB — last 2s "
+            f"{tail:.1f}dB vs preceding 3s {pre:.1f}dB)")
+    return delta
+
+
+def existing_capture_complete(path, expected_ms):
+    """Skip-guard, hardened 2026-07-24: an existing file only counts as a
+    finished capture if its REAL duration (ffprobe) covers >=90% of the track.
+    The old size>100KB heuristic let partial stubs masquerade as done tracks
+    and get skipped + sent as-is."""
+    try:
+        if not path.exists() or path.stat().st_size <= 100_000:
+            return False
+        if not expected_ms:
+            return True  # nothing to verify against — fall back to size check
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-show_entries",
+             "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+             str(path)],
+            capture_output=True, text=True, timeout=15)
+        dur = float((r.stdout or "").strip() or 0.0)
+        if dur >= 0.90 * (expected_ms / 1000.0):
+            # Duration is right — but a full-length SILENT file is the other
+            # failure mode (added 2026-07-26): if Ableton (or anything else)
+            # holds the output device, the BlackHole tap records a full-length
+            # file of nothing and the duration check happily skips it forever.
+            # Sample 60s from 20s in and require real signal.
+            if not audio_has_signal(path):
+                log(f"skip-guard: {path.name} is full-length but SILENT "
+                    f"— recapturing")
+                return False
+            return True
+        log(f"skip-guard: {path.name} is a stub ({dur:.1f}s vs expected "
+            f"{expected_ms / 1000.0:.1f}s) — recapturing")
+        return False
+    except Exception as e:
+        log(f"skip-guard: ffprobe failed for {path.name} ({e}) — treating as incomplete")
+        return False
+
+
+def capture_spotify_track(meta, dest_dir, idx=None):
+    """Capture one Spotify track. Returns (final_path, ended_via_wrap).
+    `ended_via_wrap` is True iff Spotify auto-advanced past end-of-track during
+    this capture — meaning the playback head is already on the NEXT track and
+    the caller must NOT call spotify_next() (would skip a track)."""
+    name = meta.get("name") or "Untitled"
+    artist = meta.get("artist") or ""
+    track_id = meta.get("id") or ""
+    if idx is not None:
+        base = f"{idx:02d} - {sanitize(name)}"
+    else:
+        base = sanitize(f"{name} - {artist}".strip(" -")) if artist else sanitize(name)
+    final_candidate = dest_dir / f"{base}.mp3"
+    # Resume support: if we already have a non-trivial file at this path
+    # (e.g. user re-fired the same playlist URL after an interrupted run),
+    # skip the capture and return the existing path. wrapped=False so the
+    # caller calls spotify_next() to advance through this track in playback.
+    if existing_capture_complete(final_candidate, meta.get("duration_ms")):
+        log(f"spotify capture skip (already exists, duration-verified): {final_candidate}")
+        return final_candidate, False
+    final = unique_path(final_candidate)
+    log(f"spotify capture starting: {final} id={track_id} dur={meta.get('duration_ms')}ms")
+
+    duration_s = (meta.get("duration_ms") or 0) / 1000.0
+    if duration_s <= 0:
+        log("spotify capture: no duration, abort")
+        return None, False
+
+    # Pre-flight: pause, set volume to max, seek to 0:00. Pausing first means
+    # there's no audio leaking through during the seek.
+    spotify_pause()
+    time.sleep(0.1)
+    spotify_set_volume(100)   # session value was saved by begin_spotify_volume()
+    spotify_set_position(0.0)
+    time.sleep(0.2)
+
+    # Start avrec-app FIRST and wait for the SCK stream to be writing
+    # (segment file > 0 bytes). SCK init is ~200-400ms on cold start, but
+    # under launchd-managed parents the responsibility chain for Screen
+    # Recording can take longer to establish — bumped from 3s to 8s.
+    segments = []
+    seg_id = 0
+    seg_path = SEG_DIR / f"spot-{int(time.time())}-{seg_id}.caf"
+    # Capture stderr to a temp file so a launch failure (TCC denied,
+    # bundle id wrong, etc) is diagnosable instead of silent.
+    avrec_stderr_log = SEG_DIR / f"spot-{int(time.time())}-{seg_id}.stderr.log"
+    proc = avrec_app_capture_bg(seg_path, stderr_path=avrec_stderr_log)
+    avrec_ready = False
+    for _ in range(160):  # up to 8s
+        time.sleep(0.05)
+        if seg_path.exists() and seg_path.stat().st_size > 0:
+            avrec_ready = True
+            break
+        # Early-fail check: if avrec-app exited (crash, TCC denial), bail now
+        # instead of waiting the full timeout.
+        if proc.poll() is not None:
+            try:
+                err = avrec_stderr_log.read_text()[-400:].strip() if avrec_stderr_log.exists() else ""
+            except Exception:
+                err = ""
+            log(f"spotify capture: avrec-app exited prematurely (rc={proc.returncode}) stderr={err!r}")
+            return None, False
+    if not avrec_ready:
+        try:
+            err = avrec_stderr_log.read_text()[-400:].strip() if avrec_stderr_log.exists() else ""
+        except Exception:
+            err = ""
+        log(f"spotify capture: avrec didn't start writing within 8s, aborting (stderr={err!r})")
+        avrec_stop(proc)
+        return None, False
+
+    # Defeat App Nap / display-sleep throttling: when the screen is off,
+    # Spotify is throttled and can take >5s to actually begin playback.
+    # A brief `caffeinate -u` user-activity assertion un-throttles it so
+    # captures are reliable with the screen off (auto-recover).
+    try:
+        subprocess.Popen(["caffeinate", "-u", "-t", "20"],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"spotify capture: caffeinate nudge failed (non-fatal): {e}")
+
+    # NOW play. Audio reaches BlackHole → avrec is already capturing it.
+    osa('tell application "Spotify" to play')
+    play_started = time.time()
+    started = False
+    # 15s window (was 5s): display-asleep Spotify needs longer to spin up
+    # even with the caffeinate nudge above.
+    while time.time() - play_started < 15.0:
+        st = spotify_state()
+        pos = spotify_position()
+        if st == "playing" and pos > 0.0:
+            started = True
+            break
+        time.sleep(0.05)
+    if not started:
+        log("spotify capture: never started playing within 15s")
+        avrec_stop(proc)
+        seg_path.unlink(missing_ok=True)
+        return None, False
+
+    ended_via_wrap = False
+
+    last_pos = spotify_position()
+    last_pos_change = time.time()
+    poll_count = 0
+    # ID check (osascript) — every 4 polls (~1s) once we're past initial phase.
+    ID_CHECK_EVERY = 4
+    # Tight-poll threshold: when within this many seconds of duration, switch
+    # to fast polling so we catch the wrap (auto-advance) within ~50ms.
+    TIGHT_POLL_REMAINING = 1.5
+    TIGHT_POLL_INTERVAL = 0.05
+    LOOSE_POLL_INTERVAL = 0.25
+    # Per memory feedback_record_audio_track_end:
+    # Spotify's player position resets to 0 ~1.4s BEFORE the song's audio
+    # actually ends. We extend recording past wrap by exactly that long, so
+    # the file captures the song's true tail and stops *right before* the
+    # next track starts playing — no bleed.
+    # Kept deliberately: it protects the true end. It is always trimmed back
+    # off after the capture by trim_to_stated_duration().
+    WRAP_TAIL_EXTEND = 1.4
+
+    while True:
+        # Tighten polling as we near end-of-track to catch the moment before
+        # Spotify auto-advances (otherwise the next song bleeds into the file).
+        remaining = duration_s - last_pos
+        interval = TIGHT_POLL_INTERVAL if remaining <= TIGHT_POLL_REMAINING else LOOSE_POLL_INTERVAL
+        time.sleep(interval)
+        poll_count += 1
+        st = spotify_state()
+        pos = spotify_position()
+
+        # Wrap detection: pos dropped significantly = Spotify auto-advanced.
+        # Spotify's pos counter resets ~1.4s BEFORE the song's audio actually
+        # ends — keep avrec running for WRAP_TAIL_EXTEND so the tail lands in
+        # the file, then pause right before next track starts. (Option B
+        # per Gurinder 2026-04-27.)
+        if pos + 1.0 < last_pos and last_pos > duration_s - 5.0:
+            log(f"spotify capture: pos wrapped {last_pos:.2f} -> {pos:.2f}, "
+                f"extending {WRAP_TAIL_EXTEND:.2f}s for tail")
+            time.sleep(WRAP_TAIL_EXTEND)
+            spotify_pause()
+            avrec_stop(proc)
+            segments.append(seg_path)
+            ended_via_wrap = True
+            break
+
+        if st == "stopped":
+            log(f"spotify capture: stopped st={st} pos={pos:.2f}")
+            avrec_stop(proc)
+            segments.append(seg_path)
+            break
+
+        # Track ID change (skip / unexpected advance). Cheap check — once a sec.
+        if poll_count % ID_CHECK_EVERY == 0 and track_id:
+            cur_id = osa('tell application "Spotify" to id of current track')
+            if cur_id and cur_id != track_id:
+                log(f"spotify capture: track id changed {track_id} -> {cur_id}, finalizing")
+                spotify_pause()
+                avrec_stop(proc)
+                segments.append(seg_path)
+                break
+
+        if st == "paused":
+            # Pause may transient at track-end (briefly) — re-check after a moment.
+            time.sleep(0.5)
+            st_check = spotify_state()
+            cur_id = osa('tell application "Spotify" to id of current track') if track_id else ""
+            if cur_id and track_id and cur_id != track_id:
+                log("spotify capture: paused due to track change, finalizing")
+                avrec_stop(proc)
+                segments.append(seg_path)
+                break
+            if st_check != "paused":
+                continue
+            log(f"spotify capture: paused at {pos:.2f}, waiting for resume")
+            avrec_stop(proc)
+            segments.append(seg_path)
+            send_imsg("⏸ paused — waiting for resume to continue capturing")
+            while True:
+                time.sleep(0.5)
+                st2 = spotify_state()
+                if st2 == "playing":
+                    log("spotify capture: resumed")
+                    seg_id += 1
+                    seg_path = SEG_DIR / f"spot-{int(time.time())}-{seg_id}.caf"
+                    proc = avrec_app_capture_bg(seg_path)
+                    last_pos = spotify_position()
+                    last_pos_change = time.time()
+                    break
+                if st2 == "stopped":
+                    log("spotify capture: stopped while paused, aborting")
+                    return None, False
+            continue
+
+        if pos != last_pos:
+            last_pos = pos
+            last_pos_change = time.time()
+        elif (time.time() - last_pos_change) > 3.0 and pos >= duration_s - 1.0:
+            log(f"spotify capture: pos stuck near end {pos:.2f}, finalizing")
+            avrec_stop(proc)
+            segments.append(seg_path)
+            break
+
+    if not segments:
+        return None, False
+    if not encode_caf_to_mp3(segments, final):
+        log("encode failed")
+        for s in segments:
+            s.unlink(missing_ok=True)
+        return None, False
+    for s in segments:
+        s.unlink(missing_ok=True)
+
+    # The WRAP_TAIL_EXTEND margin has done its job — the song's true end is in
+    # the file. Cut it back off before anything else touches this capture, so
+    # no file can carry the opening of the next track. Tags are written after.
+    trim_to_stated_duration(final, duration_s)
+
+    art_bytes = fetch_artwork(meta.get("artwork_url", ""))
+    write_id3(final, meta, art_bytes)
+    check_tail_bleed(final)
+    log(f"spotify capture done: {final}")
+    mirror_to_icloud(final, MIRROR_CAPTURES)
+    return final, ended_via_wrap
+
+
+def fetch_spotify_container_title(kind, sid):
+    """Fetch the public title of a Spotify playlist/album from its embed page's
+    og:title meta tag. Returns None on failure (caller falls back to a default)."""
+    try:
+        import requests
+        import html as html_mod
+        url = f"https://open.spotify.com/{kind}/{sid}"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        m = re.search(r'<meta property="og:title" content="([^"]*)"', r.text)
+        if not m:
+            return None
+        return html_mod.unescape(m.group(1)).strip()
+    except Exception as e:
+        log(f"container title fetch fail: {e}")
+        return None
+
+
+def capture_spotify_url(uri, kind):
+    if not spotify_launch():
+        send_imsg(f"{SIG} couldn't launch Spotify.app")
+        return []
+
+    # Hard rule (2026-07-11): every Spotify capture is silent on the speakers.
+    # Route the default output to BlackHole 2ch for the session (SCK still
+    # taps the app, so the recording is full quality). State persisted so an
+    # interrupted capture still restores — see begin/end_spotify_silence.
+    begin_spotify_silence()
+    begin_spotify_volume()
+    check_spotify_playback_prefs()
+
+    try:
+        return _capture_spotify_url_inner(uri, kind)
+    finally:
+        end_spotify_playback()   # pause BEFORE the speakers come back
+        end_spotify_volume()
+        end_spotify_silence()
+
+
+def _capture_spotify_url_inner(uri, kind):
+    captured = []
+
+    if kind == "track":
+        # For single-track URIs, queue overrides have bitten us before — verify
+        # Spotify actually navigated to the requested track and retry on miss.
+        if not spotify_play_verified(uri):
+            send_imsg(f"{SIG} Spotify didn't navigate to requested track (queue override?)")
+            return []
+        meta = spotify_current_track()
+        if not meta or not meta.get("name"):
+            send_imsg(f"{SIG} couldn't read Spotify track metadata")
+            return []
+        send_imsg(f"\U0001f399 capturing: {meta['name']} — {meta['artist']}")
+        out, _ = capture_spotify_track(meta, STORAGE)
+        if out:
+            captured.append(out)
+        return captured
+
+    # Playlist / album: play the container itself (URI == context).
+    spotify_play(uri)
+    time.sleep(1.5)
+
+    first_meta = spotify_current_track()
+    if not first_meta or not first_meta.get("id"):
+        send_imsg(f"{SIG} couldn't read first track of {kind}")
+        return []
+    if kind == "album":
+        container_name = first_meta.get("album") or "Album"
+    else:
+        sid = uri.split(":")[-1]
+        container_name = fetch_spotify_container_title("playlist", sid) or "Playlist"
+    # Resume support: reuse an existing folder of the same name rather than
+    # spawning Folder (2)/(3)/... — capture_spotify_track skips already-present
+    # tracks individually, so partial runs naturally complete on re-fire.
+    folder = STORAGE / sanitize(container_name or "Spotify")
+    folder.mkdir(parents=True, exist_ok=True)
+    log(f"spotify {kind} folder: {folder}")
+    send_imsg(f"\U0001f399 capturing {kind}: {container_name}\nfolder: {folder.name}/")
+
+    # Delivery policy 2026-06-09 (Gurinder): captured tracks ship to Telegram
+    # only (tg_send_audio), regardless of Ableton state. iMessage attach is
+    # retired here — the old Ableton-open / iCloud-mirror skip no longer applies
+    # since we never push files to iMessage anymore.
+    seen_ids = set()
+    track_idx = 0
+    cur_meta = first_meta
+    while cur_meta and cur_meta.get("id") not in seen_ids:
+        seen_ids.add(cur_meta["id"])
+        track_idx += 1
+        send_imsg(f"\U0001f399 [{track_idx}] {cur_meta['name']} — {cur_meta['artist']}")
+        out, wrapped = capture_spotify_track(cur_meta, folder, idx=track_idx)
+        if out:
+            captured.append(out)
+            if SPOTIFY_AUTOSEND:
+                tg_send_audio(out)  # Telegram-only delivery (2026-06-09 policy)
+            else:
+                log(f"spotify autosend OFF (2026-07-26 policy) — left on disk: {out.name}")
+        # If the capture ended via pos-wrap, Spotify already auto-advanced to
+        # the next track (paused at ~1.4s in). Calling spotify_next() here
+        # would jump TWO tracks ahead — that was the every-other-track skip
+        # bug. Only call next() when we did NOT auto-advance.
+        if not wrapped:
+            spotify_next()
+        time.sleep(1.5)
+        new_meta = spotify_current_track()
+        if not new_meta or not new_meta.get("id"):
+            break
+        if new_meta["id"] in seen_ids:
+            break
+        if spotify_state() == "stopped":
+            break
+        cur_meta = new_meta
+
+    send_imsg(f"{SIG} {kind} done: {len(captured)} tracks → {folder}")
+    return captured
+
+
+def capture_ytdlp(url):
+    send_imsg(f"\U0001f399 yt-dlp: downloading\n{url}")
+    cmd = [
+        YTDLP,
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--postprocessor-args", "ffmpeg:-b:a 320k -ar 44100 -ac 2",
+        "--embed-thumbnail", "--add-metadata",
+        "--no-playlist" if "list=" not in url else "--yes-playlist",
+        "--output", str(STORAGE / "%(title)s.%(ext)s"),
+        "--print", "after_move:filepath",
+        url,
+    ]
+    log(f"yt-dlp: {' '.join(shlex.quote(c) for c in cmd)}")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        send_imsg(f"{SIG} yt-dlp failed:\n{r.stderr.strip()[:400]}")
+        log(f"yt-dlp rc={r.returncode}: {r.stderr}")
+        return []
+    paths = [Path(p) for p in r.stdout.strip().splitlines() if p.strip() and Path(p).exists()]
+    for p in paths:
+        mirror_to_icloud(p, MIRROR_DOWNLOADS)
+    return paths
+
+
+def parse_duration(s):
+    s = s.strip().lower()
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([smh]?)$", s)
+    if not m:
+        return None
+    n = float(m.group(1))
+    unit = m.group(2) or "s"
+    return n * {"s": 1, "m": 60, "h": 3600}[unit]
+
+
+def is_url_arg(s):
+    s = s.strip()
+    return s.startswith(("http://", "https://", "spotify:"))
+
+
+def cmd_stop():
+    state = load_state() or {}
+    queue_clear()
+    me = os.getpid()
+
+    # 1) SIGTERM avrec processes (raw indef + Spotify segments).
+    try:
+        r = subprocess.run(["pgrep", "-f", AVREC_PGREP], capture_output=True, text=True)
+        for s in r.stdout.split():
+            try:
+                p = int(s)
+                if p != me:
+                    os.kill(p, signal.SIGTERM)
+            except (ValueError, OSError):
+                pass
+        time.sleep(0.5)
+        r2 = subprocess.run(["pgrep", "-f", AVREC_PGREP], capture_output=True, text=True)
+        for s in r2.stdout.split():
+            try:
+                p = int(s)
+                if p != me:
+                    os.kill(p, signal.SIGKILL)
+            except (ValueError, OSError):
+                pass
+    except Exception as e:
+        log(f"stop: pgrep avrec failed: {e}")
+
+    # 2) Also SIGTERM any leftover ffmpeg-from-BlackHole (legacy path).
+    try:
+        r = subprocess.run(["pgrep", "-f", "avfoundation"], capture_output=True, text=True)
+        for s in r.stdout.split():
+            try:
+                p = int(s)
+                if p != me:
+                    os.kill(p, signal.SIGTERM)
+            except (ValueError, OSError):
+                pass
+    except Exception:
+        pass
+
+    # 3) For raw_indef mode, encode the captured CAF to the final MP3.
+    if state.get("mode") == "raw_indef":
+        caf = state.get("caf_path")
+        out_mp3 = state.get("out_path")
+        if caf and out_mp3 and Path(caf).exists():
+            if encode_caf_to_mp3([Path(caf)], Path(out_mp3)):
+                Path(caf).unlink(missing_ok=True)
+            else:
+                log(f"raw_indef encode failed for {caf}")
+
+    # 4) SIGTERM the daemon holding the pidlock (URL captures fork off a worker).
+    locked = current_pid()
+    if locked and locked != me:
+        try:
+            os.kill(locked, signal.SIGTERM)
+            time.sleep(0.3)
+            if pid_running(locked):
+                os.kill(locked, signal.SIGKILL)
+        except OSError:
+            pass
+
+    exit_capture_mode()
+    end_spotify_playback(require_session=True)  # killed capture: don't leave Spotify playing
+    end_spotify_volume()   # restore Spotify's own volume if we pinned it to 100
+    end_spotify_silence()  # restore speakers if a muted Spotify capture was killed
+    release_pidlock()
+
+    out_path = state.get("out_path")
+    if out_path and Path(out_path).exists():
+        p = Path(out_path)
+        tg_send_audio(p)  # Telegram-only delivery (2026-06-09 policy)
+        return f"{SIG} stopped — saved → {p.name}"
+    return f"{SIG} stopped"
+
+
+def cmd_mute():
+    set_muted(True)
+    return f"{SIG} speakers muted (recording continues at unity)"
+
+
+def cmd_unmute():
+    set_muted(False)
+    return f"{SIG} speakers unmuted"
+
+
+def cmd_list():
+    files = sorted(STORAGE.rglob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+    if not files:
+        return "(no recordings yet)"
+    lines = []
+    for f in files:
+        rel = f.relative_to(STORAGE)
+        size_mb = f.stat().st_size / 1_000_000
+        lines.append(f"• {rel}  ({size_mb:.1f} MB)")
+    return "\n".join(lines)
+
+
+def cmd_queue():
+    pid = current_pid()
+    items = queue_load()
+    out = []
+    if pid:
+        out.append(f"\U0001f399 recording (pid {pid})")
+    if items:
+        out.append(f"queue ({len(items)}):")
+        for i, it in enumerate(items, 1):
+            out.append(f"  {i}. {it.get('label', it.get('url', ''))}")
+    else:
+        out.append("queue empty")
+    return "\n".join(out)
+
+
+def cmd_raw_capture(duration, name=""):
+    if not acquire_pidlock():
+        return None
+    enter_capture_mode(silent=False)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fname = f"{sanitize(name)}-{ts}.mp3" if name else f"capture-{ts}.mp3"
+    out_mp3 = unique_path(STORAGE / fname)
+    seg_path = SEG_DIR / f"raw-{int(time.time())}.caf"
+    proc = avrec_capture_bg(seg_path)
+    log(f"raw capture pid={proc.pid} -> {out_mp3} (caf={seg_path}) dur={duration}")
+    if duration:
+        try:
+            time.sleep(duration)
+        finally:
+            avrec_stop(proc)
+            encode_caf_to_mp3([seg_path], out_mp3)
+            seg_path.unlink(missing_ok=True)
+            exit_capture_mode()
+            release_pidlock()
+        return out_mp3 if out_mp3.exists() else None
+    # Indef: hand pid lock off to avrec so a stale Python pid doesn't fool
+    # `current_pid()` after this process exits.
+    PIDFILE.write_text(str(proc.pid))
+    state = load_state() or {}
+    state["avrec_pid"] = proc.pid
+    state["caf_path"] = str(seg_path)
+    state["out_path"] = str(out_mp3)
+    state["mode"] = "raw_indef"
+    save_state(state)
+    return out_mp3
+
+
+def process_url(url):
+    if not acquire_pidlock():
+        return []
+    captured = []
+    try:
+        spot = spotify_normalize(url)
+        if spot:
+            # Spotify captures use ScreenCaptureKit per-app audio (avrec-app)
+            # — no system audio routing changes needed. Spotify keeps playing
+            # on the user's normal output, other apps stay audible too, and
+            # only Spotify's audio stream lands in the file.
+            kind, uri = spot
+            captured = capture_spotify_url(uri, kind)
+        else:
+            captured = capture_ytdlp(url)
+    finally:
+        release_pidlock()
+    return captured
+
+
+def daemonize() -> bool:
+    """Fork: parent returns False (caller exits), child returns True (does work).
+    Child detaches from controlling terminal so the watcher doesn't block on it."""
+    pid = os.fork()
+    if pid > 0:
+        return False
+    os.setsid()
+    si = open(os.devnull, "r")
+    so = open("/tmp/record-audio-bg.log", "a")
+    os.dup2(si.fileno(), 0)
+    os.dup2(so.fileno(), 1)
+    os.dup2(so.fileno(), 2)
+    return True
+
+
+def url_worker(url):
+    """Background URL handler: process URL + drain queue + send single-track attaches."""
+    # Track which captured files came from Spotify so the Ableton-open rule can
+    # suppress *their* iMessage attach while still sending yt-dlp/SoundCloud rips.
+    spotify_files = set()
+
+    def _run(u):
+        cap = process_url(u)
+        if spotify_normalize(u):
+            spotify_files.update(cap)
+        return cap
+
+    captured = _run(url)
+    while True:
+        head = queue_pop()
+        if not head:
+            break
+        captured += _run(head["url"])
+    # Send single-track files (album subfolder files were already sent inline).
+    # Delivery policy 2026-06-09 (Gurinder): Telegram-only — no iMessage attach.
+    for p in captured:
+        try:
+            if p.parent != STORAGE:
+                continue
+            if p in spotify_files and not SPOTIFY_AUTOSEND:
+                # 2026-07-26 policy: Spotify captures stay on disk only.
+                log(f"spotify autosend OFF (2026-07-26 policy) — left on disk: {p.name}")
+                continue
+            tg_send_audio(p)  # Telegram-only delivery (yt-dlp rips; Spotify if re-enabled)
+        except Exception as e:
+            log(f"url_worker send fail: {e}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        out = cmd_raw_capture(None)
+        print(f"\U0001f399 recording started → {out.name if out else '(failed)'}")
+        return 0
+
+    cmd = args[0].lower()
+
+    if cmd == "stop":
+        print(cmd_stop()); return 0
+    if cmd == "mute":
+        print(cmd_mute()); return 0
+    if cmd == "unmute":
+        print(cmd_unmute()); return 0
+    if cmd == "list":
+        print(cmd_list()); return 0
+    if cmd == "queue":
+        print(cmd_queue()); return 0
+
+    if cmd == "start":
+        name = " ".join(args[1:])
+        out = cmd_raw_capture(None, name)
+        print(f"\U0001f399 recording started → {out.name if out else '(failed)'}")
+        return 0
+
+    raw = " ".join(args).strip()
+
+    if is_url_arg(raw):
+        if current_pid():
+            n = queue_append({"url": raw, "added": datetime.now().isoformat()})
+            print(f"\U0001f399 queued ({n} ahead)")
+            return 0
+        # Immediate ack, then fork to background so the iMessage watcher doesn't block.
+        spot = spotify_normalize(raw)
+        if spot:
+            print(f"\U0001f399 routing to Spotify capture…")
+        else:
+            print(f"\U0001f399 routing to yt-dlp…")
+        sys.stdout.flush()
+        if daemonize():
+            try:
+                url_worker(raw)
+            except Exception as e:
+                log(f"url_worker FATAL: {type(e).__name__}: {e}")
+                import traceback
+                log(traceback.format_exc())
+                send_imsg(f"{SIG} record-audio crashed: {e}")
+            finally:
+                try:
+                    release_pidlock()
+                except Exception:
+                    pass
+            os._exit(0)
+        return 0
+
+    dur = parse_duration(raw)
+    if dur is not None:
+        if current_pid():
+            print(f"{SIG} already recording — `record-audio stop` first")
+            return 0
+        print(f"\U0001f399 recording {dur:.0f}s…")
+        sys.stdout.flush()
+        if daemonize():
+            try:
+                out = cmd_raw_capture(dur)
+                if out and out.exists():
+                    tg_send_audio(out)  # Telegram-only delivery (2026-06-09 policy)
+                    send_imsg(f"{SIG} recorded {dur:.0f}s → {out.name}")
+                else:
+                    send_imsg(f"{SIG} recording failed")
+            except Exception as e:
+                log(f"duration capture FATAL: {type(e).__name__}: {e}")
+                import traceback
+                log(traceback.format_exc())
+                send_imsg(f"{SIG} record-audio crashed: {e}")
+            finally:
+                try:
+                    release_pidlock()
+                except Exception:
+                    pass
+            os._exit(0)
+        return 0
+
+    print(f"unknown command: {raw}")
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        log(f"FATAL: {type(e).__name__}: {e}")
+        import traceback
+        log(traceback.format_exc())
+        print(f"{SIG} record-audio crashed: {e}")
+        try:
+            release_pidlock()
+        except Exception:
+            pass
+        sys.exit(99)

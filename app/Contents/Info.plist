@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>Audio Downloader</string>
+  <key>CFBundleDisplayName</key><string>Audio Downloader</string>
+  <key>CFBundleIdentifier</key><string>com.audiodownloader.launcher</string>
+  <key>CFBundleVersion</key><string>1.6.0</string>
+  <key>CFBundleShortVersionString</key><string>1.6.0</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleExecutable</key><string>AudioDownloader</string>
+  <key>CFBundleIconFile</key><string>icon</string>
+  <key>LSMinimumSystemVersion</key><string>14.4</string>
+  <key>LSUIElement</key><false/>
+  <key>NSHighResolutionCapable</key><true/>
+</dict></plist>
