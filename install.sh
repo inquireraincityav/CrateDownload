@@ -351,7 +351,8 @@ ok "interpreter -> $RUNPY"
 # ------------------------------------------------------------- 3. copy files
 say "Installing files"
 mkdir -p "$BIN" "$SUPPORT/state" "$HOME/Applications" "$HOME/Library/LaunchAgents"
-for f in audio-downloader record-audio adcfg.py; do
+for f in audio-downloader record-audio adcfg.py \
+         tg_control.py waveform.py naming.py tracklist.py search.py pools.py; do
   cp "$SRC/bin/$f" "$BIN/$f" || { bad "missing payload: bin/$f"; exit 1; }
 done
 for f in avrec avrec-app spotify-ctl ad-multiout ensure-blackhole-rate; do
