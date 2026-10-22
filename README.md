@@ -1,7 +1,11 @@
-# Audio Downloader
+# Grab
 
 Paste a Spotify link, get the track. Albums and playlists too. Everything
 happens on this Mac — no account, no server, nothing leaves the machine.
+
+> The project ships under the display name **Grab**. The internal plumbing
+> (support folder, launchd service, config paths) still carries the original
+> `Audio Downloader` identifiers so existing installs keep working.
 
 ---
 
@@ -50,7 +54,7 @@ Shared tools it installs through Homebrew: `ffmpeg`, `yt-dlp`,
 
 ## Using it
 
-Open **Audio Downloader** from Launchpad. Paste one or more links, hit Capture.
+Open **Grab** from Launchpad. Paste one or more links, hit Capture.
 
 - **Spotify** track / album / playlist — recorded from the Spotify app
 - **YouTube / SoundCloud** — downloaded directly, no recording needed

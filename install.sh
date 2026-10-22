@@ -21,6 +21,11 @@
 set -uo pipefail
 
 APP_NAME="Audio Downloader"
+# User-facing display name. Separate from APP_NAME so renames don't move the
+# support dir, config file, launchd job, or music folder — only the Launchpad
+# icon and the window title follow DISPLAY_NAME. Override via env to try a
+# different label without reinstalling: AUDIO_DOWNLOADER_DISPLAY_NAME=... ./install.sh
+DISPLAY_NAME="${AUDIO_DOWNLOADER_DISPLAY_NAME:-Grab}"
 LABEL="${AUDIO_DOWNLOADER_LABEL:-com.audiodownloader.server}"
 SUPPORT="${AUDIO_DOWNLOADER_PREFIX:-$HOME/Library/Application Support/$APP_NAME}"
 BIN="$SUPPORT/bin"
@@ -30,9 +35,9 @@ CONFIG="$SUPPORT/config.json"
 # sudo. Spotlight indexes ~/Applications too, but an app people expect to find
 # by name belongs in the folder they actually look in.
 if [ -w /Applications ]; then
-  APPDIR="/Applications/$APP_NAME.app"
+  APPDIR="/Applications/$DISPLAY_NAME.app"
 else
-  APPDIR="$HOME/Applications/$APP_NAME.app"
+  APPDIR="$HOME/Applications/$DISPLAY_NAME.app"
 fi
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,7 +81,7 @@ bad()  { printf '  \033[31mx\033[0m %s\n' "$*"; }
 # the audio device -> remove files. Captured music and the shared Homebrew
 # tools are the two things it will not touch without being told to.
 if [ "$DO_UNINSTALL" = 1 ]; then
-  say "Uninstalling $APP_NAME"
+  say "Uninstalling $DISPLAY_NAME"
 
   # What this install actually created. Without it an uninstall triggered from
   # the app has to GUESS the app bundle path from defaults — which, for an
@@ -211,7 +216,7 @@ if [ "$DO_UNINSTALL" = 1 ]; then
   exit 0
 fi
 
-say "Installing $APP_NAME"
+say "Installing $DISPLAY_NAME"
 
 # ------------------------------------------------------------ 0. sanity checks
 [ "$(uname -s)" = "Darwin" ] || { bad "macOS only."; exit 1; }

@@ -930,7 +930,7 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Audio Downloader</title>
+<title>Grab</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127908;</text></svg>">
 <style>
   :root{ --bg:#0d0f12; --card:#16191f; --card2:#1c2027; --line:#262b34;
@@ -1056,7 +1056,7 @@ PAGE = r"""<!doctype html>
   @media (max-width:520px){ section,header .wrap{padding-left:14px;padding-right:14px} }
 </style></head><body>
 <header><div class="wrap">
-  <h1><span class="dot" id="dot"></span> Audio Downloader <small id="clock"></small>
+  <h1><span class="dot" id="dot"></span> Grab <small id="clock"></small>
       <button class="gear" id="gear" title="Settings" type="button">&#9881;</button></h1>
   <form id="f" autocomplete="off">
     <textarea id="u" placeholder="Paste Spotify link — track, album or playlist (one per line)"
@@ -1080,7 +1080,7 @@ PAGE = r"""<!doctype html>
   <div class="card">
     <div class="dz-copy">Three macOS privacy switches. Apple won't let any installer
       flip these &mdash; they have to be tapped by you, once per Mac, ever. Each button
-      opens the exact pane; find <b>Audio Downloader</b> in the list and turn it on.</div>
+      opens the exact pane; find <b>Grab</b> in the list and turn it on.</div>
     <div id="permrows"></div>
     <div class="cfgbar"><div class="sp"></div>
       <button class="mini" id="setupdone" type="button">Hide this</button></div>
@@ -1468,8 +1468,8 @@ async function tick(){
       (s.mirrors && s.mirrors.length ? " (+ " + s.mirrors.length + " mirror" +
        (s.mirrors.length > 1 ? "s" : "") + ")" : "");
     document.title = s.capturing
-      ? "🎙 " + (s.now && s.now.track ? s.now.track : "capturing") + " — Audio Downloader"
-      : "Audio Downloader";
+      ? "🎙 " + (s.now && s.now.track ? s.now.track : "capturing") + " — Grab"
+      : "Grab";
   }catch(e){
     if(++failures > 2) $("#clock").textContent = "app offline";
   }
@@ -1482,7 +1482,7 @@ tick(); setInterval(tick, 1500);
 # ----------------------------------------------------------------- http layer
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "AudioDownloader/1.0"
+    server_version = "Grab/1.0"
 
     def log_message(self, fmt, *a):      # keep stdout clean under launchd
         pass
