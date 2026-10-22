@@ -73,7 +73,32 @@ def _send(token: str, chat_id: str, text: str) -> None:
         pass
 
 
+def _bar(percent: float, width: int = 20) -> str:
+    """Monospace progress bar — renders cleanly in Telegram's default font."""
+    try:
+        p = max(0.0, min(100.0, float(percent or 0)))
+    except (TypeError, ValueError):
+        p = 0.0
+    filled = int(round(p / 100.0 * width))
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
+
+
+def _fmt_secs(s) -> str:
+    try:
+        s = int(round(float(s)))
+    except (TypeError, ValueError):
+        return "?"
+    m, s = divmod(max(0, s), 60)
+    return f"{m}:{s:02d}"
+
+
 def _format_progress(progress) -> str:
+    """Multi-line status reply with a progress bar. Format:
+
+        ▶ capturing: Fisher - Losing It (Extended Mix)
+        [████████░░░░░░░░░░░░] 42% · 1:35 / 3:42
+        3 of 20 tracks done · in: My Favorite Playlist
+    """
     if not progress:
         return "idle."
     track = progress.get("track") or "(reading log…)"
@@ -81,14 +106,21 @@ def _format_progress(progress) -> str:
     pct = progress.get("percent")
     done = progress.get("done_count") or 0
     container = progress.get("container")
-    bits = [f"{stage}: {track}"]
+    elapsed = progress.get("elapsed")
+    duration = progress.get("duration")
+
+    lines = [f"▶ {stage}: {track}"]
     if pct is not None:
-        bits.append(f"{pct}%")
+        time_tag = f" · {_fmt_secs(elapsed)} / {_fmt_secs(duration)}" if duration else ""
+        lines.append(f"{_bar(pct)} {pct}%{time_tag}")
+    tail_bits = []
     if done:
-        bits.append(f"({done} done)")
+        tail_bits.append(f"{done} track{'s' if done != 1 else ''} done")
     if container:
-        bits.append(f"in {container}")
-    return " ".join(bits)
+        tail_bits.append(f"in: {container}")
+    if tail_bits:
+        lines.append(" · ".join(tail_bits))
+    return "\n".join(lines)
 
 
 def _format_recent(files, limit=10) -> str:
@@ -208,13 +240,104 @@ def _handle(settings, token, chat_id, text,
     _send(token, chat_id, " · ".join(bits) or "accepted.")
 
 
-def start(settings, submit_fn, progress_fn, recent_fn, stop_fn, resend_fn, log_fn):
+PUSH_POLL = 8.0           # seconds between watcher polls — low enough to feel
+                          # live on a phone, high enough not to tax the bot API
+
+
+def _watcher_loop(settings, progress_fn, submits_fn, log_fn):
+    """Push live updates to Telegram as the capture state changes. Fires at
+    track transitions and on errors — NOT on every poll — so the chat doesn't
+    get spammed by heartbeats.
+
+    State we track between polls (local to this thread):
+    - last track string we announced
+    - last done_count we announced
+    - set of submit entries we've already pinged a failure for
+    """
+    token, chat_id = settings.telegram_creds()
+    if not (token and chat_id):
+        return
+    chat_id = str(chat_id)
+
+    last_track: str | None = None
+    last_done: int = 0
+    last_container: str | None = None
+    seen_errors: set = set()
+    was_capturing: bool = False
+
+    log_fn("tg_control: push watcher started")
+
+    while True:
+        time.sleep(PUSH_POLL)
+        try:
+            # --- capture-side transitions --------------------------------------
+            p = progress_fn()
+            if p:
+                container = p.get("container")
+                track = p.get("track")
+                done = int(p.get("done_count") or 0)
+
+                # Album/playlist boundary: a new container shows up, reset
+                # per-batch counters so a "finished" line fires fresh later.
+                if container and container != last_container:
+                    last_container = container
+                    last_done = 0
+
+                # Each new track worth announcing exactly once.
+                if track and track != last_track:
+                    _send(token, chat_id, f"▶ Capturing: {track}"
+                          + (f"\n  in: {container}" if container else ""))
+                    last_track = track
+
+                # A single-track completion inside a batch — only report when
+                # done_count has advanced AND we've just moved off a track.
+                if done > last_done and last_track is not None:
+                    last_done = done
+
+                was_capturing = True
+
+            elif was_capturing:
+                # Transition: capture just finished. Report once per batch.
+                tag = f" from {last_container}" if last_container else ""
+                _send(token, chat_id,
+                      f"✅ Done{tag}" +
+                      (f" · {last_done} track{'s' if last_done != 1 else ''}"
+                       if last_done else ""))
+                last_track = None
+                last_done = 0
+                last_container = None
+                was_capturing = False
+
+            # --- submit-side failures ------------------------------------------
+            for s in (submits_fn() or [])[:30]:
+                if s.get("status") not in ("error", "rejected"):
+                    continue
+                # Dedup by (url, t) — each submit entry's timestamp is unique.
+                key = (s.get("url") or "", s.get("t") or 0)
+                if key in seen_errors:
+                    continue
+                seen_errors.add(key)
+                reason = (s.get("result") or "")[:200] or "unknown reason"
+                _send(token, chat_id,
+                      f"⚠️ Failed: {s.get('url')}\n  {reason}")
+
+            # Keep the dedup set small.
+            if len(seen_errors) > 500:
+                seen_errors = set(list(seen_errors)[-200:])
+
+        except Exception as e:
+            log_fn(f"tg_control watcher error: {type(e).__name__}: {e}")
+
+
+def start(settings, submit_fn, progress_fn, recent_fn, stop_fn, resend_fn,
+          log_fn, submits_fn=None):
     """Fire the control loop in a daemon thread if config permits.
 
     `settings` is the shared adcfg.SETTINGS. The server passes its own
     callables for everything that touches server state (submit, recent files,
-    live progress, stop, resend) so this module stays free of imports from
-    `audio-downloader` — nothing to circular-import, nothing to lock across.
+    live progress, stop, resend, submits_fn for the push watcher) so this
+    module stays free of imports from `audio-downloader` — nothing to
+    circular-import, nothing to lock across.
     """
     if not getattr(settings, "tg_control_enabled", False):
         return None
@@ -222,10 +345,26 @@ def start(settings, submit_fn, progress_fn, recent_fn, stop_fn, resend_fn, log_f
     if not (token and chat_id):
         log_fn("tg_control: enabled but no token/chat_id in config; skipping")
         return None
+    threads = []
     t = threading.Thread(
         target=_run_loop,
         args=(settings, submit_fn, progress_fn, recent_fn, stop_fn,
               resend_fn, log_fn),
         name="tg-control", daemon=True)
     t.start()
-    return t
+    threads.append(t)
+
+    # Push watcher is opt-in-but-default-on when control is enabled, so
+    # most users get the "feels like a notification stream" behaviour.
+    push_enabled = (settings.raw.get("notify", {})
+                            .get("telegram", {})
+                            .get("push_updates", True))
+    if push_enabled and submits_fn is not None:
+        tw = threading.Thread(
+            target=_watcher_loop,
+            args=(settings, progress_fn, submits_fn, log_fn),
+            name="tg-push", daemon=True)
+        tw.start()
+        threads.append(tw)
+
+    return threads

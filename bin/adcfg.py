@@ -112,6 +112,12 @@ DEFAULTS = {
             # chat_id only. Independent of `enabled` so people can keep the
             # outbound pipe without opening the inbound channel.
             "control_enabled": False,
+            # Push-side watcher. When control_enabled is on, a background
+            # thread posts "capturing: ...", "done: ..." and failure messages
+            # as the state machine advances, so an iPhone sees progress the
+            # way the web UI does. Opt out with false if you prefer to poll
+            # by messaging `status` yourself.
+            "push_updates": True,
         },
         "imessage": {
             "enabled": False,

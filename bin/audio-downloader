@@ -1653,6 +1653,10 @@ def main():
         except Exception as e:
             applog(f"tg_resend spawn failed: {e}")
 
+    def _tg_submits():
+        with SUBMIT_LOCK:
+            return list(SUBMITS)
+
     tg_control.start(
         settings=CFG,
         submit_fn=submit,
@@ -1661,6 +1665,7 @@ def main():
         stop_fn=_tg_stop,
         resend_fn=_tg_resend,
         log_fn=applog,
+        submits_fn=_tg_submits,
     )
     ThreadingHTTPServer.allow_reuse_address = True
     # Loopback (the default) is a plain IPv4 bind. The dual-stack socket is
