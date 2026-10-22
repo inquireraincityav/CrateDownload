@@ -47,11 +47,31 @@ open_in() {   # $1 = app bundle path
   return 1
 }
 
-if open_in "/Applications/Google Chrome.app"; then
-  exit 0
-elif open_in "/Applications/Microsoft Edge.app"; then
-  exit 0
-else
-  # Whatever the default browser is: always works, just not chromeless.
-  open "$URL"
-fi
+# Browser preference. Safari first — it is already running on most Macs, uses
+# the least RAM, and keeps the launcher's shutdown of other heavy browsers off
+# the critical path. Chrome / Edge fall through only if Safari isn't present
+# (so an uninstall of Safari still leaves the app usable).
+PREFER="${AUDIO_DOWNLOADER_BROWSER:-safari}"
+
+open_safari() {
+  [ -d "/Applications/Safari.app" ] || return 1
+  /usr/bin/open -a Safari "$URL"
+}
+
+case "$PREFER" in
+  safari)
+    open_safari && exit 0
+    open_in "/Applications/Google Chrome.app" && exit 0
+    open_in "/Applications/Microsoft Edge.app" && exit 0 ;;
+  chrome)
+    open_in "/Applications/Google Chrome.app" && exit 0
+    open_in "/Applications/Microsoft Edge.app" && exit 0
+    open_safari && exit 0 ;;
+  edge)
+    open_in "/Applications/Microsoft Edge.app" && exit 0
+    open_in "/Applications/Google Chrome.app" && exit 0
+    open_safari && exit 0 ;;
+esac
+
+# Fallback: whatever the system default browser is.
+open "$URL"
