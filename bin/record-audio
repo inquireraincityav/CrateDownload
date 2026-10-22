@@ -1789,7 +1789,7 @@ def fetch_spotify_container_title(kind, sid):
         return None
 
 
-def capture_spotify_url(uri, kind):
+def capture_spotify_url(uri, kind, folder=None, index=None):
     if not spotify_launch():
         send_imsg(f"{SIG} couldn't launch Spotify.app")
         return []
@@ -1803,15 +1803,25 @@ def capture_spotify_url(uri, kind):
     check_spotify_playback_prefs()
 
     try:
-        return _capture_spotify_url_inner(uri, kind)
+        return _capture_spotify_url_inner(uri, kind, folder=folder, index=index)
     finally:
         end_spotify_playback()   # pause BEFORE the speakers come back
         end_spotify_volume()
         end_spotify_silence()
 
 
-def _capture_spotify_url_inner(uri, kind):
+def _capture_spotify_url_inner(uri, kind, folder=None, index=None):
     captured = []
+
+    # Resolve destination: optional subfolder of STORAGE when the caller
+    # (DJ-set tracklist expansion) wants everything grouped together.
+    dest = STORAGE
+    if folder:
+        dest = STORAGE / folder
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            dest = STORAGE
 
     if kind == "track":
         # For single-track URIs, queue overrides have bitten us before — verify
@@ -1824,7 +1834,8 @@ def _capture_spotify_url_inner(uri, kind):
             send_imsg(f"{SIG} couldn't read Spotify track metadata")
             return []
         send_imsg(f"\U0001f399 capturing: {meta['name']} — {meta['artist']}")
-        out, _ = capture_spotify_track(meta, STORAGE)
+        # idx on capture_spotify_track controls the "NN - " filename prefix.
+        out, _ = capture_spotify_track(meta, dest, idx=index)
         if out:
             captured.append(out)
         return captured
@@ -1888,17 +1899,43 @@ def _capture_spotify_url_inner(uri, kind):
     return captured
 
 
-def capture_ytdlp(url):
+def capture_ytdlp(url, folder=None, index=None):
+    """Download the audio from a YouTube / SoundCloud URL via yt-dlp.
+
+    `folder` (str): optional subfolder of STORAGE to drop files into. Used
+    by DJ-set tracklist expansion so a whole set lands in one container.
+    `index` (int): 1-based position in that container, used to prefix the
+    cleaned filename with "NN - " so the folder sorts in play order.
+
+    Audio-only is enforced three ways:
+    - `-f bestaudio/best` picks the smallest audio-only format up front, so
+      yt-dlp doesn't fetch any video bytes it later throws away.
+    - `--extract-audio --audio-format mp3` is a belt + braces: even if the
+      "bestaudio" pick ever yielded a container with a video stream, this
+      strips it.
+    - `-x` is implicit in --extract-audio.
+    """
     send_imsg(f"\U0001f399 yt-dlp: downloading\n{url}")
+    dest_dir = (STORAGE / folder) if folder else STORAGE
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        dest_dir = STORAGE
+    # Pre-prefix the yt-dlp output template with "NN - " so even yt-dlp's
+    # own progress/log messages name the file in sorted-order form. naming
+    # cleanup below rewrites the title half, keeping the prefix.
+    prefix = f"{int(index):02d} - " if index is not None else ""
+    out_tpl = str(dest_dir / f"{prefix}%(title)s.%(ext)s")
     cmd = [
         YTDLP,
+        "-f", "bestaudio/best",
         "--extract-audio",
         "--audio-format", "mp3",
         "--audio-quality", "0",
         "--postprocessor-args", "ffmpeg:-b:a 320k -ar 44100 -ac 2",
         "--embed-thumbnail", "--add-metadata",
         "--no-playlist" if "list=" not in url else "--yes-playlist",
-        "--output", str(STORAGE / "%(title)s.%(ext)s"),
+        "--output", out_tpl,
         "--print", "after_move:filepath",
         url,
     ]
@@ -1911,10 +1948,14 @@ def capture_ytdlp(url):
     paths = [Path(p) for p in r.stdout.strip().splitlines() if p.strip() and Path(p).exists()]
     cleaned = []
     for p in paths:
-        # yt-dlp's filename stem is the uploader's raw title. Clean it,
-        # rewrite ID3, rename the file. Mirror + waveform work on the
-        # NEW path so mirrored copies carry the clean name too.
-        final = naming.rename_and_retag(p, p.stem, sanitize=sanitize, log=log)
+        # Strip the "NN - " prefix we added to the template before feeding the
+        # stem to the title cleaner, else "01 - " becomes part of the parsed
+        # artist. The index gets re-applied by rename_and_retag.
+        raw_stem = p.stem
+        if prefix and raw_stem.startswith(prefix):
+            raw_stem = raw_stem[len(prefix):]
+        final = naming.rename_and_retag(p, raw_stem, sanitize=sanitize,
+                                        log=log, index=index)
         mirror_to_icloud(final, MIRROR_DOWNLOADS)
         waveform.generate(final, FFMPEG, log=log)
         cleaned.append(final)
@@ -2080,7 +2121,7 @@ def cmd_raw_capture(duration, name=""):
     return out_mp3
 
 
-def process_url(url):
+def process_url(url, folder=None, index=None):
     if not acquire_pidlock():
         return []
     captured = []
@@ -2092,9 +2133,9 @@ def process_url(url):
             # on the user's normal output, other apps stay audible too, and
             # only Spotify's audio stream lands in the file.
             kind, uri = spot
-            captured = capture_spotify_url(uri, kind)
+            captured = capture_spotify_url(uri, kind, folder=folder, index=index)
         else:
-            captured = capture_ytdlp(url)
+            captured = capture_ytdlp(url, folder=folder, index=index)
     finally:
         release_pidlock()
     return captured
@@ -2115,24 +2156,30 @@ def daemonize() -> bool:
     return True
 
 
-def url_worker(url):
-    """Background URL handler: process URL + drain queue + send single-track attaches."""
+def url_worker(url, folder=None, index=None):
+    """Background URL handler: process URL + drain queue + send single-track attaches.
+
+    `folder`/`index` apply to the FIRST URL only. Queued items carry their
+    own folder/index in the queue entry dict (set by queue_append), so a
+    DJ-set tracklist expansion keeps each track's position intact even
+    when the queue drains asynchronously.
+    """
     # Track which captured files came from Spotify so the Ableton-open rule can
     # suppress *their* iMessage attach while still sending yt-dlp/SoundCloud rips.
     spotify_files = set()
 
-    def _run(u):
-        cap = process_url(u)
+    def _run(u, f=None, i=None):
+        cap = process_url(u, folder=f, index=i)
         if spotify_normalize(u):
             spotify_files.update(cap)
         return cap
 
-    captured = _run(url)
+    captured = _run(url, folder, index)
     while True:
         head = queue_pop()
         if not head:
             break
-        captured += _run(head["url"])
+        captured += _run(head["url"], head.get("folder"), head.get("index"))
     # Send single-track files (album subfolder files were already sent inline).
     # Delivery policy 2026-06-09 (Gurinder): Telegram-only — no iMessage attach.
     for p in captured:
@@ -2150,6 +2197,26 @@ def url_worker(url):
 
 def main():
     args = sys.argv[1:]
+
+    # Consume --folder <name> and --index <N> flags before anything else.
+    # These apply to the URL that follows and (if the capture is already
+    # busy) are stashed on the queue entry so each track in a DJ set
+    # keeps its position prefix.
+    folder = None
+    index = None
+    while args and args[0] in ("--folder", "--index"):
+        flag = args.pop(0)
+        if not args:
+            break
+        val = args.pop(0)
+        if flag == "--folder":
+            folder = val or None
+        elif flag == "--index":
+            try:
+                index = int(val)
+            except ValueError:
+                index = None
+
     if not args:
         out = cmd_raw_capture(None)
         print(f"\U0001f399 recording started → {out.name if out else '(failed)'}")
@@ -2190,7 +2257,12 @@ def main():
 
     if is_url_arg(raw):
         if current_pid():
-            n = queue_append({"url": raw, "added": datetime.now().isoformat()})
+            entry = {"url": raw, "added": datetime.now().isoformat()}
+            if folder is not None:
+                entry["folder"] = folder
+            if index is not None:
+                entry["index"] = index
+            n = queue_append(entry)
             print(f"\U0001f399 queued ({n} ahead)")
             return 0
         # Immediate ack, then fork to background so the iMessage watcher doesn't block.
@@ -2202,7 +2274,7 @@ def main():
         sys.stdout.flush()
         if daemonize():
             try:
-                url_worker(raw)
+                url_worker(raw, folder=folder, index=index)
             except Exception as e:
                 log(f"url_worker FATAL: {type(e).__name__}: {e}")
                 import traceback

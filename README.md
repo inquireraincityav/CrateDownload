@@ -58,7 +58,9 @@ Open **Grab** from Launchpad. Paste one or more links, hit Capture.
 
 - **Spotify** track / album / playlist — recorded from the Spotify app
 - **YouTube / SoundCloud** — downloaded directly, no recording needed
-- **1001tracklists** set URL — parses the tracklist and searches each entry
+- **1001tracklists** set URL — parses the tracklist, searches each entry,
+  and saves them to a folder named after the set with `01 - `, `02 - `, …
+  filename prefixes so they sort in play order
 - **Free text** like "Fisher - Losing It VIP Mix" — resolved via the
   search layer; a version marker steers the pick (SoundCloud wins for VIPs
   that Spotify doesn't carry)

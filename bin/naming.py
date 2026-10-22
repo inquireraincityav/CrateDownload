@@ -145,16 +145,22 @@ def split(raw: str) -> tuple[str, str, str]:
 
 
 def filename_for(artist: str, title: str, version: str, ext: str = ".mp3",
-                 sanitize=None) -> str:
+                 sanitize=None, index=None) -> str:
     """Build a filesystem name from parsed fields. Version lives in parens
     on the title side so filesystem-sort by filename still groups a track's
-    variants together."""
+    variants together. `index` (1-based) prefixes the name with a zero-padded
+    "NN - " so a DJ set's tracks sort in play order."""
     base = title
     if version:
         base = f"{title} ({version})"
     name = f"{artist} - {base}" if artist else base
     if sanitize is not None:
         name = sanitize(name)
+    if index is not None:
+        try:
+            name = f"{int(index):02d} - {name}"
+        except (TypeError, ValueError):
+            pass
     return f"{name}{ext}"
 
 
@@ -185,17 +191,21 @@ def retag_file(path: Path, artist: str, title: str, version: str,
 
 
 def rename_and_retag(path: Path, raw_title: str, sanitize=None,
-                     log=lambda m: None) -> Path:
+                     log=lambda m: None, index=None) -> Path:
     """Clean `raw_title`, retag `path` in place, and rename it to the clean
     name. Returns the new path (same as input if nothing changed, or if the
     cleaned name collides with another file in the same folder — in that case
-    we tag but don't rename, to avoid clobbering a resume target)."""
+    we tag but don't rename, to avoid clobbering a resume target).
+
+    `index` (1-based) prefixes the saved filename with "NN - " so a DJ set's
+    tracks sort by play order on disk.
+    """
     artist, title, version = split(raw_title)
     if not (artist or title):
         return path
     retag_file(path, artist, title, version, log=log)
     new_name = filename_for(artist, title, version, ext=path.suffix,
-                            sanitize=sanitize)
+                            sanitize=sanitize, index=index)
     if new_name == path.name:
         return path
     dest = path.with_name(new_name)

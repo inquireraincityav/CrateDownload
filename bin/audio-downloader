@@ -720,14 +720,16 @@ def _fire_pool(url: str, entry: dict):
     Spotify navigation), so they run in-process on the server. The finished
     file goes through naming cleanup + waveform generation like a yt-dlp rip."""
     try:
-        saved, note = pools.download(url, CFG, STORAGE, log=applog)
+        dest = STORAGE / entry["folder"] if entry.get("folder") else STORAGE
+        saved, note = pools.download(url, CFG, dest, log=applog)
         if not saved:
             entry["status"] = "error"
             entry["result"] = note
             applog(f"pool fire {url} -> {note}")
             return
         clean = naming.rename_and_retag(saved, saved.stem,
-                                        sanitize=lambda s: s, log=applog)
+                                        sanitize=lambda s: s, log=applog,
+                                        index=entry.get("index"))
         try:
             waveform.generate(clean, CFG.ffmpeg, log=applog)
         except Exception as e:
@@ -747,11 +749,16 @@ def fire(url: str, entry: dict):
     if pools.is_pool_url(url):
         _fire_pool(url, entry)
         return
+    extra = []
+    if entry.get("folder"):
+        extra += ["--folder", str(entry["folder"])]
+    if entry.get("index") is not None:
+        extra += ["--index", str(entry["index"])]
     with FIRE_LOCK:
         was_busy = current_pid() is not None
         try:
             r = subprocess.run(
-                RECORD_AUDIO_CMD + [url],
+                RECORD_AUDIO_CMD + extra + [url],
                 capture_output=True, text=True, timeout=60,
             )
             out = (r.stdout or "").strip() or (r.stderr or "").strip()
@@ -773,9 +780,31 @@ def fire(url: str, entry: dict):
                 time.sleep(0.1)
 
 
-def _submit_entry(url: str, src: str, kind: str, note: str = "") -> dict:
-    return {"url": url, "status": "sending", "result": note,
-            "src": src, "kind": kind, "t": time.time()}
+def _submit_entry(url: str, src: str, kind: str, note: str = "",
+                  folder: str = "", index=None) -> dict:
+    e = {"url": url, "status": "sending", "result": note,
+         "src": src, "kind": kind, "t": time.time()}
+    if folder:
+        e["folder"] = folder
+    if index is not None:
+        e["index"] = index
+    return e
+
+
+def _slug_from_1001(url: str) -> str:
+    """Derive a container-folder name from a 1001tracklists URL.
+    e.g. https://.../tracklist/abc123/dj-name-event-2026-01-01.html
+         -> "dj-name-event-2026-01-01"
+    Falls back to a timestamp so a folder is always created."""
+    try:
+        tail = urlparse(url).path.rstrip("/").split("/")[-1] or ""
+        slug = re.sub(r"\.html?$", "", tail, flags=re.IGNORECASE)
+        slug = re.sub(r"[^A-Za-z0-9._\- ]+", "-", slug).strip("-")
+        if slug:
+            return slug[:120]
+    except Exception:
+        pass
+    return "tracklist-" + datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def submit(text: str):
@@ -802,7 +831,10 @@ def submit(text: str):
                               "result": "no tracks parsed from 1001tracklists page",
                               "src": None, "kind": None, "t": time.time()})
                 continue
-            for t in tracks:
+            # One container folder for the whole set, so filesystem sort
+            # inside it reflects play order (01 - ..., 02 - ..., 03 - ...).
+            set_folder = _slug_from_1001(u)
+            for pos, t in enumerate(tracks, start=1):
                 hit = search.resolve(t["query"], CFG.ytdlp, settings=CFG, log=applog)
                 if not hit:
                     found.append({"url": t["query"], "status": "rejected",
@@ -811,7 +843,8 @@ def submit(text: str):
                                   "t": time.time()})
                     continue
                 found.append(_submit_entry(hit["url"], hit["src"], "track",
-                                           note=f"{t['query']} → {hit['label']}"))
+                                           note=f"{pos:02d}. {t['query']} → {hit['label']}",
+                                           folder=set_folder, index=pos))
             continue
 
         src, kind = classify(u)
